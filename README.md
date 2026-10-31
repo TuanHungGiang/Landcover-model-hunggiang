@@ -55,3 +55,14 @@ Original LoveDA IDs: `0` means no-data; `1..7` represent the seven classes. The 
 - Trainer uses a single GPU (does not automatically distribute training over both Kaggle T4s).
 - `configs/t4_*.yaml` are configuration references; the runnable trainer accepts CLI flags and currently does not parse YAML.
 - `Kaggle_Quickstart.ipynb`, data, outputs, and checkpoints are intentionally not committed.
+
+
+## 200-image validation and multiclass threshold tuning
+
+Training now selects a fixed **100 Rural + 100 Urban** images from official LoveDA `Val/Val` using seed 42. These 200 images are used for checkpoint selection by raw mIoU, then **after training** for multiclass classwise decision thresholds. Remaining official Val images are excluded from tuning and optionally evaluated once with `--evaluate-holdout`.
+
+```bash
+python scripts/train_loveda.py --context conv --size 512 --batch 1 --accum 4 --epochs 100 --val-count 200 --seed 42 --evaluate-holdout
+```
+
+The selected file list is saved in `val_split_200.json` and must be retained for reproducible resumed training. Final `calibration.json` stores the seven classwise thresholds and raw/tuned metrics. Prediction is `argmax(softmax(logits)/class_threshold)`; this is **decision-threshold tuning**, not temperature-based probability calibration and not binary sigmoid thresholding. Calibrated mIoU on the selected 200 images is **not independent test performance**. The remaining held-out Val subset is a more suitable estimate if only evaluated once. The trainer reads command line arguments, not the YAML settings.
