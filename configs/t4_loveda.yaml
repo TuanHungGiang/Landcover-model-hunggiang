@@ -1,28 +1,21 @@
-# Starting point ONLY; profile actual T4 VRAM and train throughput.
-dataset: LoveDA
-num_classes: 7
-ignore_index: 0  # verify your label mapping first
-image_size: 512
-semantic_encoder: resnet34
-pretrained_semantic: false  # true requires download or cached ImageNet weights
-context_type: conv        # switch to mamba ONLY after mamba_ssm is installed
-context_dim: 160
-context_depth: 2
-detail4: 48
-detail8: 96
-detail_depth4: 2
-detail_depth8: 2
-rep_kernel: 7
-decoder_channels: 64
-boundary_aux: false
+# Reference settings; runnable CLI: python scripts/train_loveda.py --context conv --size 512 --batch 1 --accum 4 --epochs 100
+data:
+  dataset: loveda
+  root: /kaggle/input/datasets/alienxc137/loveda-satellite-images-semantic-segmentation
+  train_structure: Train/Train/{Rural,Urban}/{images_png,masks_png}
+  val_structure: Val/Val/{Rural,Urban}/{images_png,masks_png}
+  crop_size: 512
+  ignore_index: 255
+model:
+  num_classes: 7
+  semantic_encoder: resnet34
+  pretrained_semantic: true
+  context_type: conv
+  context_dim: 160
+  context_depth: 2
 train:
-  batch_size_per_gpu: 1 # start with 1; profile and raise to 2 if possible
-  grad_accum_steps: 4
-  precision: fp16_amp
-  optimizer: adamw
-  learning_rate: 0.0002
-  weight_decay: 0.01
   epochs: 100
-  gradient_clip_norm: 1.0
-  scheduler: cosine
-  seed: 42
+  batch_size_per_gpu: 1
+  grad_accum_steps: 4
+  lr: 0.0002
+  output_dir: /kaggle/working/sdr_loveda
