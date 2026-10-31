@@ -1,0 +1,33 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Model artifacts and datasets
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+checkpoints/
+outputs/
+weights/
+data/
+datasets/
+runs/
+wandb/
+
+# Kaggle notebook and generated artifacts
+Kaggle_Quickstart.ipynb
+*.ipynb
+/kaggle/
+*.zip
+*.tar.gz
+
+# Environment
+.env
+.venv/
+venv/
+.DS_Store
