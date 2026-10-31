@@ -1,0 +1,6 @@
+torch>=2.1
+torchvision>=0.16
+numpy
+Pillow
+PyYAML
+# Optional: mamba-ssm and causal-conv1d (install separately with CUDA compatibility)
