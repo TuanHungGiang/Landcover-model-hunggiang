@@ -27,6 +27,10 @@ from scripts.loveda_fast import (ROOT, NAMES, FastLoveDA, ImageShardedEvalSample
                                  find_pairs, eval_distributed, calibration_samples,
                                  tune_thresholds_logits)
 from scripts.val200_calibration import select_validation_200
+from scripts.training_diagnostics import (
+    StepCudaTimer, DiagnosticsWriter, class_health, gate_scales,
+    selected_grad_norms,
+)
 from sdr_mambanet import SDRConfig, SDRMambaNet
 from sdr_mambanet.losses.segmentation import SegmentationLoss
 
@@ -57,6 +61,14 @@ def arguments():
                    help="Optional NHWC format; benchmark first on your T4")
     p.add_argument("--fused-adamw", action="store_true",
                    help="Optional CUDA fused AdamW if available")
+    p.add_argument("--log-every", type=int, default=100,
+                   help="Report progress and loss components every N local GPU iterations")
+    p.add_argument("--profile-every", type=int, default=200,
+                   help="Sample CUDA event/module timings every N optimizer-step-aligned iterations; 0 disables")
+    p.add_argument("--no-diagnostics", action="store_true",
+                   help="Disable extra JSONL diagnostics, module timers and printed per-class health")
+    p.add_argument("--warn-iou-below", type=float, default=0.10,
+                   help="Warn when a present class remains below this IoU after epoch 5")
     return p.parse_args()
 
 
@@ -70,6 +82,8 @@ def make_loader(ds, batch, workers, sampler=None, *, shuffle=False):
 
 def main():
     a = arguments()
+    if a.log_every < 1 or a.profile_every < 0 or not 0 <= a.warn_iou_below <= 1:
+        raise ValueError("--log-every >=1, --profile-every >=0, --warn-iou-below in [0,1]")
     if a.batch < 1 or a.accum < 1 or a.workers < 0:
         raise ValueError("--batch/--accum must be positive, --workers nonnegative")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
@@ -101,6 +115,7 @@ def main():
                 find_pairs(root, "val"), root, output,
                 seed=a.seed, count=a.val_count, resume=True)
 
+        diag = DiagnosticsWriter(output, rank, enabled=not a.no_diagnostics)
         train_ds = FastLoveDA(find_pairs(root, "train"), a.size, True,
                               cache_size=a.train_cache_images)
         train_sampler = DistributedSampler(train_ds, num_replicas=world,
@@ -126,6 +141,7 @@ def main():
             raw = raw.to(memory_format=torch.channels_last)
         ddp = DDP(raw, device_ids=[local_rank], output_device=local_rank,
                   find_unused_parameters=False, gradient_as_bucket_view=True)
+        profiler = StepCudaTimer(ddp.module) if rank == 0 and not a.no_diagnostics and a.profile_every else None
         loss_fn = SegmentationLoss(ignore_index=255, dice_weight=1.).to(device)
         if a.fused_adamw:
             try:
@@ -162,27 +178,107 @@ def main():
             ddp.train()
             optimizer.zero_grad(set_to_none=True)
             loss_total = torch.zeros((), device=device)
+            ce_total = torch.zeros_like(loss_total)
+            dice_total = torch.zeros_like(loss_total)
             nsteps = len(train_dl)
+            if not a.no_diagnostics:
+                torch.cuda.reset_peak_memory_stats(device)
             start_train = time.perf_counter()
+            fetch_start = time.perf_counter()
+            loader_wait_sum, loader_wait_max = 0.0, 0.0
             for step, (image, mask) in enumerate(train_dl):
+                loader_wait = time.perf_counter() - fetch_start
+                loader_wait_sum += loader_wait
+                loader_wait_max = max(loader_wait_max, loader_wait)
+                first = (step // a.accum) * a.accum
+                group_size = min(a.accum, nsteps - first)
+                sync = (step + 1) % a.accum == 0 or step + 1 == nsteps
+                profile_now = bool(profiler and step > 0 and sync and
+                                   (step + 1) % a.profile_every == 0)
+                if profile_now:
+                    profiler.begin()
+                    profiler.mark("copy_begin")
                 image = image.to(device, non_blocking=True)
                 if a.channels_last:
                     image = image.contiguous(memory_format=torch.channels_last)
                 mask = mask.to(device, non_blocking=True)
-                first = (step // a.accum) * a.accum
-                group_size = min(a.accum, nsteps - first)
-                sync = (step + 1) % a.accum == 0 or step + 1 == nsteps
+                if profile_now:
+                    profiler.mark("copy_end")
+                    profiler.mark("forward_begin")
                 with (nullcontext() if sync else ddp.no_sync()):
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        loss = loss_fn(ddp(image), mask)["total"]
+                        loss_parts = loss_fn(ddp(image), mask)
+                        loss = loss_parts["total"]
                     loss_total.add_(loss.detach())
+                    ce_total.add_(loss_parts["ce"].detach())
+                    dice_total.add_(loss_parts["dice"].detach())
+                    if profile_now:
+                        profiler.mark("forward_end")
+                        profiler.mark("backward_begin")
                     scaler.scale(loss / group_size).backward()
+                if profile_now:
+                    profiler.mark("backward_end")
+                grad_norm = None
+                grad_parts = None
                 if sync:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(ddp.parameters(), 1.)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(ddp.parameters(), 1.)
+                    if profile_now:
+                        grad_parts = selected_grad_norms(ddp.module)
+                        profiler.mark("optimizer_begin")
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
+                    if profile_now:
+                        profiler.mark("optimizer_end")
+                if profile_now:
+                    gpu_times = profiler.finish(device)  # sampled GPU sync, NOT each iteration
+                    gpu_times["stage_forward_ms"] = {
+                        k: gpu_times.pop(k) for k, _ in (
+                            ("detail",0),("resnet_stem",0),("resnet_layer1",0),
+                            ("resnet_layer2",0),("resnet_layer3",0),("resnet_layer4",0),
+                            ("context_1_32",0),("fusion_bi8",0),
+                            ("fusion_cross16",0),("fusion_final",0),("decoder",0)
+                        ) if k in gpu_times
+                    }
+                    gpu_times["grad_norm_by_module"] = {
+                        k: round(float(v.item()), 5) for k, v in (grad_parts or {}).items()
+                    }
+                    gpu_times["grad_norm_before_clipping"] = float(grad_norm.item())
+                    gpu_times["data_wait_ms"] = round(loader_wait * 1000, 2)
+                    gpu_times["gpu_allocated_gib"] = round(torch.cuda.memory_allocated(device)/2**30, 3)
+                    gpu_times["gpu_reserved_gib"] = round(torch.cuda.memory_reserved(device)/2**30, 3)
+                    diag.write("gpu_profile", epoch=epoch+1, local_step=step+1, **gpu_times)
+                    if rank == 0:
+                        top_stages = sorted(gpu_times["stage_forward_ms"].items(),
+                                            key=lambda item: item[1], reverse=True)[:4]
+                        print("[PROFILE] GPU0 " + " | ".join(
+                            f"{k}={v:.1f}ms" for k,v in top_stages) +
+                            f" | fwd={gpu_times.get('forward_ms',0):.1f}ms"
+                            f" bwd={gpu_times.get('backward_ms',0):.1f}ms"
+                            f" opt={gpu_times.get('optimizer_ms',0):.1f}ms",flush=True)
+                if not a.no_diagnostics and ((step+1) % a.log_every == 0 or step+1 == nsteps):
+                    # Host sync only every log interval, never at all other steps.
+                    progress = dict(epoch=epoch+1, local_step=step+1, local_steps=nsteps,
+                                    loss=float((loss_total/(step+1)).item()),
+                                    ce=float((ce_total/(step+1)).item()),
+                                    dice=float((dice_total/(step+1)).item()),
+                                    avg_loader_wait_ms=round(loader_wait_sum/(step+1)*1000,2),
+                                    max_loader_wait_ms=round(loader_wait_max*1000,2),
+                                    elapsed_s=round(time.perf_counter()-start_train,2),
+                                    peak_allocated_gib=round(torch.cuda.max_memory_allocated(device)/2**30,3),
+                                    peak_reserved_gib=round(torch.cuda.max_memory_reserved(device)/2**30,3),
+                                    lr=optimizer.param_groups[0]["lr"],
+                                    amp_scale=scaler.get_scale())
+                    diag.write("train_step", **progress)
+                    if rank == 0:
+                        print(f"[TRAIN] epoch={epoch+1} step={step+1}/{nsteps} "
+                              f"loss={progress['loss']:.4f} CE={progress['ce']:.4f} "
+                              f"Dice={progress['dice']:.4f} "
+                              f"loader_wait={progress['avg_loader_wait_ms']:.1f}ms "
+                              f"peakVRAM={progress['peak_allocated_gib']:.2f}GiB "
+                              f"AMP={progress['amp_scale']:.0f}", flush=True)
+                fetch_start = time.perf_counter()
             scheduler.step()
             dist.all_reduce(loss_total, op=dist.ReduceOp.SUM)
             train_time = time.perf_counter() - start_train
@@ -191,7 +287,31 @@ def main():
             stats = eval_distributed(ddp.module, val_dl, device,
                                      channels_last=a.channels_last)
             val_time = time.perf_counter() - start_val
+            if not a.no_diagnostics:
+                diag.write("epoch_rank", epoch=epoch+1,
+                           train_seconds=round(train_time,2), val_seconds=round(val_time,2),
+                           avg_loader_wait_ms=round(loader_wait_sum/max(nsteps,1)*1000,2),
+                           max_loader_wait_ms=round(loader_wait_max*1000,2),
+                           peak_allocated_gib=round(torch.cuda.max_memory_allocated(device)/2**30,3),
+                           peak_reserved_gib=round(torch.cuda.max_memory_reserved(device)/2**30,3))
             if rank == 0:
+                if not a.no_diagnostics:
+                    per_class, health_alerts = class_health(
+                        stats["confusion"], epoch=epoch+1, low_iou=a.warn_iou_below)
+                    scales = gate_scales(ddp.module)
+                    stats["class_health"] = per_class
+                    stats["gate_scales"] = scales
+                    diag.write("validation_health", epoch=epoch+1, miou=stats["miou"],
+                               per_class=per_class, gate_scales=scales,
+                               warnings=health_alerts)
+                    print("[CLASSES] " + " | ".join(
+                        f"{row['class']} IoU={row['iou']:.3f} "
+                        f"GT={row['gt_fraction']:.3f} PRED={row['pred_fraction']:.3f}"
+                        for row in per_class), flush=True)
+                    print("[GATES] " + ", ".join(
+                        f"{k}={v:+.4f}" for k, v in scales.items()), flush=True)
+                    for warning in health_alerts:
+                        print("[WARNING] " + warning, flush=True)
                 stats.update(epoch=epoch + 1,
                              train_loss=float((loss_total / (world * nsteps)).item()),
                              train_seconds=round(train_time, 2),
@@ -218,6 +338,7 @@ def main():
             dist.barrier()  # Do not let the next epoch start while rank0 saves.
 
         if not a.no_calibrate and (output / "best.pt").exists():
+            calibration_started = time.perf_counter()
             best_state = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
             ddp.module.load_state_dict(best_state["model"])
             ddp.module.eval()
@@ -235,6 +356,11 @@ def main():
                 tuned, fit = tune_thresholds_logits(logits, targets, device=device)
                 thresholds.copy_(torch.as_tensor(tuned, dtype=torch.float32, device=device))
             dist.broadcast(thresholds, src=0)
+            if rank == 0 and not a.no_diagnostics:
+                diag.write("calibration_fit", samples=int(fit["sampled_pixels"]),
+                           raw_sample_miou=float(fit["raw_sample_miou"]),
+                           tuned_sample_miou=float(fit["tuned_sample_miou"]),
+                           thresholds=[round(float(v),4) for v in thresholds.cpu().tolist()])
             evaluated = eval_distributed(ddp.module, val_dl, device,
                                           thresholds=thresholds,
                                           channels_last=a.channels_last)
@@ -262,8 +388,18 @@ def main():
             if rank == 0:
                 (output / "calibration.json").write_text(json.dumps(result, indent=2))
                 print("Saved calibration.json (multi-GPU Val + holdout evaluation)", flush=True)
+                if not a.no_diagnostics:
+                    elapsed = round(time.perf_counter()-calibration_started,2)
+                    diag.write("calibration_complete", elapsed_s=elapsed,
+                               calibrated_miou=evaluated["calibrated"]["miou"],
+                               raw_miou=evaluated["argmax"]["miou"])
+                    print(f"[CALIB] elapsed={elapsed:.1f}s, "
+                          f"raw_mIoU={evaluated['argmax']['miou']:.4f}, "
+                          f"tuned_mIoU={evaluated['calibrated']['miou']:.4f}", flush=True)
             dist.barrier()
     finally:
+        if "profiler" in locals() and profiler is not None:
+            profiler.close()
         dist.destroy_process_group()
 
 
