@@ -4,8 +4,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ipynb_checkpoints/
-
-# Model artifacts and datasets
 *.pt
 *.pth
 *.ckpt
@@ -14,19 +12,13 @@ __pycache__/
 checkpoints/
 outputs/
 weights/
-data/
 datasets/
 runs/
 wandb/
-
-# Kaggle notebook and generated artifacts
 Kaggle_Quickstart.ipynb
 *.ipynb
-/kaggle/
 *.zip
 *.tar.gz
-
-# Environment
 .env
 .venv/
 venv/
