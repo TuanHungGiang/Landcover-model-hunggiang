@@ -1,51 +1,57 @@
-# SDR-MambaNet — ResNet34 backbone (research prototype)
+# SDR-MambaNet — ResNet34 + RSF-Rep (research prototype)
 
-A modular PyTorch model for high-resolution remote-sensing semantic segmentation, designed around a **ResNet34 semantic branch**, an experimental **RSF-Rep detail branch**, optional **Mamba context**, gated fusion and a lightweight decoder.
+PyTorch semantic segmentation model with a ResNet34 semantic encoder, RSF-Rep detail branch, optional Mamba, gated fusion, and a lightweight decoder.
 
-> **Status:** This repository currently contains the **model components and configuration reference only**, not the full dataset loaders, training/validation scripts, or inference pipeline. The complete local archive is available in the original ChatGPT conversation. The architecture and novel re-parameterization claims have **not been validated on LoveDA or Potsdam**.
+## LoveDA on Kaggle
 
-## Clone and test in Kaggle
+Dataset: alienxc137/loveda-satellite-images-semantic-segmentation
 
-```bash
+The trainer supports the following exact layout:
+```text
+Train/Train/Rural/images_png + masks_png
+Train/Train/Urban/images_png + masks_png
+Val/Val/Rural/images_png + masks_png
+Val/Val/Urban/images_png + masks_png
+```
+
+Clone from a Kaggle notebook:
+
+```python
 !git clone https://github.com/TuanHungGiang/Landcover-model-hunggiang.git
 %cd /kaggle/working/Landcover-model-hunggiang
 !python smoke_test.py
 ```
 
-Kaggle normally already includes PyTorch and torchvision; install packages from `requirements.txt` if necessary. The smoke test uses ResNet34 without pretrained weights and uses `context_type="conv"` (a **CNN baseline, not Mamba**), so the smoke test avoids network downloads and custom CUDA dependencies.
-
-## Construct ResNet34 + optional Mamba
-
+Train **CNN baseline**, 512×512, single T4:
 ```python
-from sdr_mambanet import SDRConfig, SDRMambaNet
-
-cfg = SDRConfig(
-    num_classes=7,
-    semantic_encoder="resnet34",
-    pretrained_semantic=True,  # needs cached weights or Internet
-    context_type="conv",       # change to "mamba" after installing compatible mamba-ssm
-    context_dim=160,
-    context_depth=2,
-)
-model = SDRMambaNet(cfg).cuda()
+!python scripts/train_loveda.py --context conv --size 512 --batch 1 --accum 4 --epochs 100
 ```
 
-Only convolutional RSF-Rep submodules support structural reparameterization; Mamba and input-dependent gates remain dynamic. `pretrained_semantic=True` initializes the ResNet backbone with ImageNet weights, not the rest of the network.
+Train 1024×1024 (peak memory is higher; batch 1 is only a starting point):
+```python
+!python scripts/train_loveda.py --context conv --size 1024 --batch 1 --accum 4 --epochs 100
+```
 
-## Current modules
+Train **real Mamba** (requires working compatible `mamba_ssm` CUDA installation):
+```python
+!python scripts/train_loveda.py --context mamba --size 512 --batch 1 --accum 4 --epochs 100
+```
 
-- `sdr_mambanet/models.py` — model assembly and configuration
-- `sdr_mambanet/backbone/` — detail, ResNet34 semantic, and dual-branch backbone
-- `sdr_mambanet/blocks/rsf_rep.py` — experimental constrained spatial-kernel reparameterization
-- `sdr_mambanet/blocks/context.py` — optional Mamba and explicit convolution baseline
-- `sdr_mambanet/blocks/fusion.py` — semantic-guided fusion
-- `sdr_mambanet/decoder/light_fpn.py` — decoder
-- `sdr_mambanet/losses/segmentation.py` — segmentation loss
-- `sdr_mambanet/utils/reparameterize.py` — deploy conversion
-- `configs/` — reference training configs (not executable training entry points yet)
+When Kaggle Internet is disabled and no ImageNet weights are cached, add `--no-pretrained` for a **from-scratch baseline**, or attach a local ResNet34 weights file and use `--resnet-weights-path /kaggle/input/your-weights/resnet34.pth`.
 
-## Important data protocol
+Dataset root defaults to:
+`/kaggle/input/datasets/alienxc137/loveda-satellite-images-semantic-segmentation`.
 
-For original LoveDA labels, ignore raw `0` (no-data) and map raw classes `1..7` to training IDs `0..6`. Potsdam has a different six-class taxonomy, so use a separate class mapping and segmentation head.
+Outputs: `/kaggle/working/sdr_loveda/best.pt`, `last.pt`, `history.jsonl`, `best_metrics.json`.
 
-This code is a **prototype**, not a published SOTA implementation or reproduction of CGCNet, CRNet, DUSA-UNet, SFMNet or WeavingUnet.
+### Data protocol
+Original LoveDA IDs: `0` means no-data; `1..7` represent the seven classes. The trainer remaps `1..7 → 0..6`, while `0/255 → 255` (ignore). Validation uses all nonoverlapping patches with ignored padding and global confusion-matrix mIoU. This is **validation-set performance**, not an independent test-set result. Current trainer monitors official Val each epoch and selects best checkpoint there; for rigorous scientific reporting, consider an internal validation split within Train and reserve official Val for final evaluation.
+
+### Limitations
+- Research prototype only, not verified SOTA or a peer-reviewed novel block.
+- `--context conv` **does not use Mamba**.
+- `--context mamba` requires compiling/installing compatible `mamba_ssm`; not validated on Kaggle T4.
+- Training with 1024×1024 on T4 is not guaranteed to fit in VRAM; profile first.
+- Trainer uses a single GPU (does not automatically distribute training over both Kaggle T4s).
+- `configs/t4_*.yaml` are configuration references; the runnable trainer accepts CLI flags and currently does not parse YAML.
+- `Kaggle_Quickstart.ipynb`, data, outputs, and checkpoints are intentionally not committed.
