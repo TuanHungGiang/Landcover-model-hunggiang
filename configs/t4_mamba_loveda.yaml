@@ -1,0 +1,25 @@
+# Optional Mamba version. Requires mamba_ssm with working CUDA kernels.
+dataset: LoveDA
+num_classes: 7
+ignore_index: 0
+image_size: 512
+semantic_encoder: resnet34
+pretrained_semantic: false
+context_type: mamba
+context_dim: 160
+context_depth: 2
+detail4: 48
+detail8: 96
+detail_depth4: 2
+detail_depth8: 2
+rep_kernel: 7
+decoder_channels: 64
+boundary_aux: false
+train:
+  batch_size_per_gpu: 1
+  grad_accum_steps: 4
+  precision: fp16_amp
+  optimizer: adamw
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  epochs: 100
