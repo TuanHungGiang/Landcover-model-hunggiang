@@ -15,7 +15,7 @@ from .decoder.light_fpn import LightFPNDecoder
 @dataclass
 class SDRConfig:
     num_classes: int = 7    # LoveDA: adapt label mapping to your dataset
-    semantic_encoder: str = "resnet34"  # or 'resnet34'
+    semantic_encoder: str = "resnet34"  # full ResNet34 layer1..layer4
     pretrained_semantic: bool = True   # True may download ImageNet weights
     semantic_weights_path: str | None = None  # Optional local torchvision ResNet checkpoint
     context_type: str = "conv"          # 'conv' baseline, or genuine 'mamba'
@@ -28,12 +28,15 @@ class SDRConfig:
     rep_kernel: int = 7
     decoder_channels: int = 64
     boundary_aux: bool = False
+    architecture_version: str = "r34_layer4_bi_v2"
 
 
 class SDRMambaNet(nn.Module):
     def __init__(self, cfg: SDRConfig | None = None):
         super().__init__()
         self.cfg = cfg if cfg is not None else SDRConfig()
+        if self.cfg.architecture_version != "r34_layer4_bi_v2":
+            raise ValueError("Expected r34_layer4_bi_v2 architecture version")
         c = self.cfg
         self.backbone = DualBranchBackbone(
             detail4=c.detail4, detail8=c.detail8,

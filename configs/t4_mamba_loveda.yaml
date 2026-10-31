@@ -20,3 +20,5 @@ train:
   grad_accum_steps: 4
   lr: 0.0002
   output_dir: /kaggle/working/sdr_loveda
+
+architecture_version: r34_layer4_bi_v2 # Mamba runs at ResNet34 layer4 (1/32)

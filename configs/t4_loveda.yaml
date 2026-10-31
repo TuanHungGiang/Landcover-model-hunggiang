@@ -19,3 +19,5 @@ train:
   grad_accum_steps: 4
   lr: 0.0002
   output_dir: /kaggle/working/sdr_loveda
+
+architecture_version: r34_layer4_bi_v2 # Full ResNet34 layer4 + two-way fusion, context at 1/32

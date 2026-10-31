@@ -1,11 +1,13 @@
-"""Pretrained-capable ResNet semantic path + low-resolution contextual blocks.
+"""Full torchvision ResNet34 plus contextual blocks at layer4 (1/32).
 
-Pretraining applies ONLY to torchvision's ResNet encoder, not to Mamba,
-fusion, detail path, or decoder.
+layer2: 1/8, 128 channels; layer3: 1/16, 256 channels;
+layer4: 1/32, 512 channels. Only ResNet layers use ImageNet pretraining.
 """
 from __future__ import annotations
-from torch import nn
+
+from pathlib import Path
 import torch
+from torch import nn
 from ..blocks.context import build_context
 
 
@@ -15,56 +17,57 @@ class SemanticEncoder(nn.Module):
                  context_type: str = "conv", weights_path: str | None = None):
         super().__init__()
         try:
-            from torchvision.models import (
-                resnet18, resnet34, ResNet18_Weights, ResNet34_Weights,
-            )
-        except (ImportError, RuntimeError) as e:
-            raise ImportError("Please install a matching torch + torchvision pair") from e
-        constructors = {
-            "resnet18": (resnet18, ResNet18_Weights.DEFAULT),
-            "resnet34": (resnet34, ResNet34_Weights.DEFAULT),
-        }
-        if encoder_name not in constructors:
-            raise ValueError(f"Unsupported encoder: {encoder_name}")
-        make, weights = constructors[encoder_name]
-        # When pretrained=True torchvision may download weights; enable Kaggle
-        # internet or pre-cache the matching checkpoint.
-        net = make(weights=weights if pretrained and weights_path is None else None)
-        if weights_path is not None:
-            from pathlib import Path
+            from torchvision.models import resnet34, ResNet34_Weights
+        except (ImportError, RuntimeError) as exc:
+            raise ImportError("Install compatible torch and torchvision versions") from exc
+        if encoder_name != "resnet34":
+            raise ValueError("This full-layer4 bidirectional architecture requires resnet34")
+        net = resnet34(weights=ResNet34_Weights.DEFAULT if pretrained and not weights_path else None)
+        if weights_path:
             path = Path(weights_path)
             if not path.is_file():
-                raise FileNotFoundError(f"ResNet checkpoint not found: {path}")
+                raise FileNotFoundError(f"ResNet34 checkpoint not found: {path}")
             state = torch.load(path, map_location="cpu", weights_only=True)
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
             if not isinstance(state, dict):
-                raise ValueError("Expected torchvision ResNet state_dict checkpoint")
-            state = {k.removeprefix("module."): v for k, v in state.items()}
-            # Accept classification checkpoint with full ResNet weights.
-            required = ("conv1.weight", "layer1.0.conv1.weight", "layer3.0.conv1.weight")
-            if not all(k in state for k in required):
-                raise ValueError(
-                    "Local checkpoint does not contain torchvision ResNet encoder weights: "
-                    + ", ".join(required)
-                )
+                raise ValueError("Expected a torchvision ResNet34 state_dict")
+            state = {key.removeprefix("module."): value for key, value in state.items()}
+            required = ("conv1.weight", "layer1.0.conv1.weight",
+                        "layer3.0.conv1.weight", "layer4.0.conv1.weight")
+            if any(key not in state for key in required):
+                raise ValueError(f"Local checkpoint must include all ResNet34 layers: {required}")
             incompatible = net.load_state_dict(state, strict=False)
             if incompatible.missing_keys or incompatible.unexpected_keys:
-                print(f"[ResNet] Local checkpoint key differences: {incompatible}", flush=True)
-            print(f"[ResNet] Loaded weights from {path}", flush=True)
+                print(f"[ResNet] Checkpoint differences: {incompatible}", flush=True)
+            print(f"[ResNet] Loaded ImageNet weights: {path}", flush=True)
         self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
         self.layer1 = net.layer1
         self.layer2 = net.layer2
-        self.layer3 = net.layer3  # 1/16, 256 channels, skip layer4 for T4
-        self.project = nn.Sequential(
-            nn.Conv2d(256, context_dim, 1, bias=False),
+        self.layer3 = net.layer3
+        self.layer4 = net.layer4
+        self.project32 = nn.Sequential(
+            nn.Conv2d(512, context_dim, 1, bias=False),
             nn.GroupNorm(8 if context_dim % 8 == 0 else 1, context_dim),
         )
         self.context = build_context(context_dim, context_type, context_depth)
         self.out_channels = context_dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.layer1(self.stem(x))
-        x = self.layer2(x)
-        x = self.layer3(x)
-        return self.context(self.project(x))
+    def encode_s4(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layer1(self.stem(x))
+
+    def encode_s8(self, s4: torch.Tensor) -> torch.Tensor:
+        return self.layer2(s4)
+
+    def encode_s16(self, s8: torch.Tensor) -> torch.Tensor:
+        return self.layer3(s8)
+
+    def encode_s32(self, s16: torch.Tensor) -> torch.Tensor:
+        return self.context(self.project32(self.layer4(s16)))
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        s4 = self.encode_s4(x)
+        s8 = self.encode_s8(s4)
+        s16 = self.encode_s16(s8)
+        s32 = self.encode_s32(s16)
+        return {"s4": s4, "s8": s8, "s16": s16, "s32": s32}

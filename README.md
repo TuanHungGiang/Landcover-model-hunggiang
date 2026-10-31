@@ -1,12 +1,26 @@
-# SDR-MambaNet — ResNet34 + RSF-Rep (research prototype)
+# SDR-MambaNet v2 — ResNet34 layer4 + Bidirectional Cross-Scale Fusion
 
-PyTorch semantic segmentation model with a ResNet34 semantic encoder, RSF-Rep detail branch, optional Mamba, gated fusion, and a lightweight decoder.
+**Research prototype:** Full ResNet34 ImageNet-pretrained encoder + RSF-Rep detail encoder + gated cross-scale bidirectional feature exchange. Optional Mamba at 1/32.
 
-## LoveDA on Kaggle
+## Architecture
 
-Dataset: alienxc137/loveda-satellite-images-semantic-segmentation
+```text
+RGB
+├─ Detail: conv 1/2 -> RSF-Rep 1/4 (D4:48) -> RSF-Rep 1/8 (D8:96)
+└─ Semantic: pretrained ResNet34 layer1 (S4:64) -> layer2 (S8:128)
+     D8 <-> S8 : BidirectionalStageFusion (spatial-channel gates)
+     S8' -> layer3 (S16:256) -> layer4 (S32:512)
+     S32 -> 1x1 (160ch) -> [Mamba x2 OR CNN context x2] at 1/32
+     upsample(S32) + S16 + downsample(D8) -> SemanticCrossScaleFusion at 1/16
+     final SemanticGuidedFusion(S16 -> D8) at 1/8
+     D8 fused + D4 skip -> FPN/RSF-Rep decoder -> 7-class logits
+```
 
-The trainer supports the following exact layout:
+The original one-way fusion is retained **after** the new gated exchanges. Gates remain dynamic at inference; only RSF-Rep spatial depthwise branches support exact kernel folding. The architecture is an experimental proposal, not validated SOTA.
+
+## Kaggle LoveDA dataset
+
+Supported folders:
 ```text
 Train/Train/Rural/images_png + masks_png
 Train/Train/Urban/images_png + masks_png
@@ -14,55 +28,44 @@ Val/Val/Rural/images_png + masks_png
 Val/Val/Urban/images_png + masks_png
 ```
 
-Clone from a Kaggle notebook:
-
 ```python
 !git clone https://github.com/TuanHungGiang/Landcover-model-hunggiang.git
 %cd /kaggle/working/Landcover-model-hunggiang
 !python smoke_test.py
 ```
 
-Train **CNN baseline**, 512×512, single T4:
+**CNN-context baseline (no Mamba), ResNet34 to layer4:**
 ```python
-!python scripts/train_loveda.py --context conv --size 512 --batch 1 --accum 4 --epochs 100
+!python scripts/train_loveda.py --context conv --size 512 --batch 1 --accum 4 --epochs 100 --val-count 200 --seed 42 --evaluate-holdout
 ```
 
-Train 1024×1024 (peak memory is higher; batch 1 is only a starting point):
+**Real Mamba at 1/32 (requires compatible `mamba_ssm` CUDA installation):**
 ```python
-!python scripts/train_loveda.py --context conv --size 1024 --batch 1 --accum 4 --epochs 100
+!python scripts/train_loveda.py --context mamba --size 512 --batch 1 --accum 4 --epochs 100 --val-count 200 --seed 42 --evaluate-holdout
 ```
 
-Train **real Mamba** (requires working compatible `mamba_ssm` CUDA installation):
-```python
-!python scripts/train_loveda.py --context mamba --size 512 --batch 1 --accum 4 --epochs 100
-```
+For 1024 crops set `--size 1024`, keep batch 1 and profile T4 VRAM before long runs. With no cached ImageNet weights and no Kaggle Internet, pass `--resnet-weights-path /kaggle/input/.../resnet34.pth` or use `--no-pretrained` **only as a from-scratch baseline**.
 
-When Kaggle Internet is disabled and no ImageNet weights are cached, add `--no-pretrained` for a **from-scratch baseline**, or attach a local ResNet34 weights file and use `--resnet-weights-path /kaggle/input/your-weights/resnet34.pth`.
+**Checkpoints:** default output changed to `/kaggle/working/sdr_loveda_r34_bi_v2` to protect earlier training. Do NOT resume old layer3 checkpoints with v2; new layer4 and fusion weights change parameter shapes and names. Old code lives in the `baseline-resnet34-layer3` branch.
 
-Dataset root defaults to:
-`/kaggle/input/datasets/alienxc137/loveda-satellite-images-semantic-segmentation`.
+## Validation and threshold selection
 
-Outputs: `/kaggle/working/sdr_loveda/best.pt`, `last.pt`, `history.jsonl`, `best_metrics.json`.
+- Train 2522 images (official Train).
+- Pick fixed 100 Rural + 100 Urban from official Val with seed 42; save `val_split_200.json`.
+- Validate raw mIoU after every epoch on these 200 whole images (non-overlapping 512 tiles => 800 tiles).
+- After selecting best checkpoint, optimize multiclass *decision thresholds* `argmax(softmax(logits)/class_threshold)` on the same 200; it is NOT softmax probability calibration.
+- Optionally evaluate the remaining 1469 Val images once via `--evaluate-holdout`.
+- Original LoveDA mask 0 -> ignore 255, raw IDs 1..7 -> class indices 0..6.
 
-### Data protocol
-Original LoveDA IDs: `0` means no-data; `1..7` represent the seven classes. The trainer remaps `1..7 → 0..6`, while `0/255 → 255` (ignore). Validation uses all nonoverlapping patches with ignored padding and global confusion-matrix mIoU. This is **validation-set performance**, not an independent test-set result. Current trainer monitors official Val each epoch and selects best checkpoint there; for rigorous scientific reporting, consider an internal validation split within Train and reserve official Val for final evaluation.
+Outputs: `best.pt`, `last.pt`, `best_metrics.json`, `history.jsonl`, `val_split_200.json`, `calibration.json`.
 
-### Limitations
-- Research prototype only, not verified SOTA or a peer-reviewed novel block.
-- `--context conv` **does not use Mamba**.
-- `--context mamba` requires compiling/installing compatible `mamba_ssm`; not validated on Kaggle T4.
-- Training with 1024×1024 on T4 is not guaranteed to fit in VRAM; profile first.
-- Trainer uses a single GPU (does not automatically distribute training over both Kaggle T4s).
-- `configs/t4_*.yaml` are configuration references; the runnable trainer accepts CLI flags and currently does not parse YAML.
-- `Kaggle_Quickstart.ipynb`, data, outputs, and checkpoints are intentionally not committed.
-
-
-## 200-image validation and multiclass threshold tuning
-
-Training now selects a fixed **100 Rural + 100 Urban** images from official LoveDA `Val/Val` using seed 42. These 200 images are used for checkpoint selection by raw mIoU, then **after training** for multiclass classwise decision thresholds. Remaining official Val images are excluded from tuning and optionally evaluated once with `--evaluate-holdout`.
+## Tests
 
 ```bash
-python scripts/train_loveda.py --context conv --size 512 --batch 1 --accum 4 --epochs 100 --val-count 200 --seed 42 --evaluate-holdout
+python smoke_test.py
+python -m pytest -q tests/test_bidirectional.py
 ```
 
-The selected file list is saved in `val_split_200.json` and must be retained for reproducible resumed training. Final `calibration.json` stores the seven classwise thresholds and raw/tuned metrics. Prediction is `argmax(softmax(logits)/class_threshold)`; this is **decision-threshold tuning**, not temperature-based probability calibration and not binary sigmoid thresholding. Calibrated mIoU on the selected 200 images is **not independent test performance**. The remaining held-out Val subset is a more suitable estimate if only evaluated once. The trainer reads command line arguments, not the YAML settings.
+A no-pretrained CPU test of v2 (CNN context) checks forward/backward gradients, intermediate shapes and deploy numerical equivalence. The Mamba CUDA extension and actual T4 memory/performance have **not** been verified here.
+
+Reference configs in `configs/` are informational; the runnable trainer uses CLI flags.

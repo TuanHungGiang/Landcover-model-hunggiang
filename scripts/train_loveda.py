@@ -105,7 +105,7 @@ def main():
     p.add_argument("--accum",type=int,default=4)
     p.add_argument("--workers",type=int,default=2)
     p.add_argument("--lr",type=float,default=2e-4)
-    p.add_argument("--output",default="/kaggle/working/sdr_loveda")
+    p.add_argument("--output",default="/kaggle/working/sdr_loveda_r34_bi_v2")
     p.add_argument("--resnet-weights-path",default=None)
     p.add_argument("--no-pretrained",action="store_true")
     p.add_argument("--resume",default=None)
@@ -145,6 +145,9 @@ def main():
     start,best=0,-1.
     if a.resume:
         z=torch.load(a.resume,map_location="cpu",weights_only=False)
+        previous=z.get("model_config",{}).get("architecture_version")
+        if previous != "r34_layer4_bi_v2":
+            raise ValueError("Cannot resume legacy layer3 checkpoint with new layer4 bidirectional model. Start a new run with a separate output.")
         model.load_state_dict(z["model"])
         optimizer.load_state_dict(z["optimizer"])
         scheduler.load_state_dict(z["scheduler"])
