@@ -12,7 +12,7 @@ from ..blocks.context import build_context
 class SemanticEncoder(nn.Module):
     def __init__(self, encoder_name: str = "resnet34", pretrained: bool = False,
                  context_dim: int = 160, context_depth: int = 2,
-                 context_type: str = "conv"):
+                 context_type: str = "conv", weights_path: str | None = None):
         super().__init__()
         try:
             from torchvision.models import (
@@ -29,7 +29,29 @@ class SemanticEncoder(nn.Module):
         make, weights = constructors[encoder_name]
         # When pretrained=True torchvision may download weights; enable Kaggle
         # internet or pre-cache the matching checkpoint.
-        net = make(weights=weights if pretrained else None)
+        net = make(weights=weights if pretrained and weights_path is None else None)
+        if weights_path is not None:
+            from pathlib import Path
+            path = Path(weights_path)
+            if not path.is_file():
+                raise FileNotFoundError(f"ResNet checkpoint not found: {path}")
+            state = torch.load(path, map_location="cpu", weights_only=True)
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            if not isinstance(state, dict):
+                raise ValueError("Expected torchvision ResNet state_dict checkpoint")
+            state = {k.removeprefix("module."): v for k, v in state.items()}
+            # Accept classification checkpoint with full ResNet weights.
+            required = ("conv1.weight", "layer1.0.conv1.weight", "layer3.0.conv1.weight")
+            if not all(k in state for k in required):
+                raise ValueError(
+                    "Local checkpoint does not contain torchvision ResNet encoder weights: "
+                    + ", ".join(required)
+                )
+            incompatible = net.load_state_dict(state, strict=False)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                print(f"[ResNet] Local checkpoint key differences: {incompatible}", flush=True)
+            print(f"[ResNet] Loaded weights from {path}", flush=True)
         self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
         self.layer1 = net.layer1
         self.layer2 = net.layer2
