@@ -109,6 +109,14 @@ def main():
     p.add_argument("--resnet-weights-path",default=None)
     p.add_argument("--no-pretrained",action="store_true")
     p.add_argument("--resume",default=None)
+    p.add_argument("--seed",type=int,default=42)
+    p.add_argument("--val-count",type=int,default=200,
+                   help="Fixed balanced selection from official Val (100 Rural + 100 Urban when count=200)")
+    p.add_argument("--calibration-samples-per-tile",type=int,default=2048)
+    p.add_argument("--no-calibrate",action="store_true",
+                   help="Skip post-training classwise decision threshold tuning")
+    p.add_argument("--evaluate-holdout",action="store_true",
+                   help="Evaluate remaining official Val only once after threshold calibration")
     a=p.parse_args()
     if a.batch<1 or a.accum<1: p.error("--batch and --accum must be positive")
     torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
