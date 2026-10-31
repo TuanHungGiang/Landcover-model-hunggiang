@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sdr_mambanet import SDRConfig, SDRMambaNet
 from sdr_mambanet.losses.segmentation import SegmentationLoss
+from scripts.val200_calibration import select_validation_200, sample_pixels, tune_thresholds, evaluate_thresholds
 
 ROOT = "/kaggle/input/datasets/alienxc137/loveda-satellite-images-semantic-segmentation"
 CLASSES = ("background","building","road","water","barren","forest","agriculture")
@@ -110,11 +111,14 @@ def main():
     p.add_argument("--resume",default=None)
     a=p.parse_args()
     if a.batch<1 or a.accum<1: p.error("--batch and --accum must be positive")
-    torch.manual_seed(42); np.random.seed(42); random.seed(42)
+    torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
     dev=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root=Path(a.root)
     train=LoveDA(find_pairs(root,"train"),a.size,True)
-    val=LoveDA(find_pairs(root,"val"),a.size,False)
+    out=Path(a.output); out.mkdir(parents=True,exist_ok=True)
+    val_pairs,holdout_pairs=select_validation_200(
+        find_pairs(root,"val"),root,out,seed=a.seed,count=a.val_count,resume=bool(a.resume))
+    val=LoveDA(val_pairs,a.size,False)
     dlcfg=dict(num_workers=a.workers,pin_memory=(dev.type=="cuda"))
     train_dl=DataLoader(train,batch_size=a.batch,shuffle=True,**dlcfg)
     val_dl=DataLoader(val,batch_size=1,shuffle=False,**dlcfg)
@@ -128,7 +132,7 @@ def main():
     optimizer=torch.optim.AdamW(model.parameters(),lr=a.lr,weight_decay=.01)
     scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=a.epochs,eta_min=1e-6)
     scaler=torch.amp.GradScaler("cuda",enabled=dev.type=="cuda")
-    out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
+
     (out/"args.json").write_text(json.dumps(vars(a),indent=2))
     start,best=0,-1.
     if a.resume:
@@ -167,5 +171,30 @@ def main():
             (out/"best_metrics.json").write_text(json.dumps(stats,indent=2))
         torch.save(dict(model=model.state_dict(),epoch=epoch,best_miou=best,model_config=asdict(cfg),
                         optimizer=optimizer.state_dict(),scheduler=scheduler.state_dict(),scaler=scaler.state_dict()),out/"last.pt")
+
+    if a.no_calibrate:
+        print("Calibration disabled",flush=True)
+        return
+    saved=torch.load(out/"best.pt",map_location="cpu",weights_only=False)
+    model.load_state_dict(saved["model"])
+    model.eval()
+    probs,targets=sample_pixels(model,val_dl,dev,per_tile=a.calibration_samples_per_tile,seed=a.seed)
+    thresholds,fit=tune_thresholds(probs,targets)
+    selected_scores=evaluate_thresholds(model,val_dl,dev,thresholds)
+    result={
+        "selected_images":len(val_pairs),"untouched_holdout_images":len(holdout_pairs),
+        "thresholds":dict(zip(CLASSES,map(float,thresholds))),
+        "threshold_array":[float(v) for v in thresholds],
+        "rule":"argmax(softmax(logits)/class_thresholds)",
+        "warning":"Selected 200 Val images were used for both checkpoint selection and decision-threshold tuning; calibrated score is not independent test performance.",
+        "fit":fit,"selected_200":selected_scores,
+    }
+    if a.evaluate_holdout and holdout_pairs:
+        print("Evaluating untouched remaining Val images (once)...",flush=True)
+        holdout_dl=DataLoader(LoveDA(holdout_pairs,a.size,False),batch_size=1,shuffle=False,**dlcfg)
+        result["remaining_val_holdout"]=evaluate_thresholds(model,holdout_dl,dev,thresholds)
+    (out/"calibration.json").write_text(json.dumps(result,indent=2))
+    print("Calibrated thresholds:",result["thresholds"],flush=True)
+    print("selected mIoU:",selected_scores["argmax"]["miou"],selected_scores["calibrated"]["miou"],flush=True)
 
 if __name__=="__main__": main()
