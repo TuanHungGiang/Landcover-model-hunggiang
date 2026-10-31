@@ -17,6 +17,7 @@ class SDRConfig:
     num_classes: int = 7    # LoveDA: adapt label mapping to your dataset
     semantic_encoder: str = "resnet34"  # or 'resnet34'
     pretrained_semantic: bool = True   # True may download ImageNet weights
+    semantic_weights_path: str | None = None  # Optional local torchvision ResNet checkpoint
     context_type: str = "conv"          # 'conv' baseline, or genuine 'mamba'
     context_dim: int = 160
     context_depth: int = 2
@@ -40,6 +41,7 @@ class SDRMambaNet(nn.Module):
             rep_kernel=c.rep_kernel,
             semantic_encoder=c.semantic_encoder,
             pretrained_semantic=c.pretrained_semantic,
+            semantic_weights_path=c.semantic_weights_path,
             context_dim=c.context_dim, context_depth=c.context_depth,
             context_type=c.context_type,
         )
