@@ -63,8 +63,8 @@ def arguments():
                    help="Optional CUDA fused AdamW if available")
     p.add_argument("--log-every", type=int, default=100,
                    help="Report progress and loss components every N local GPU iterations")
-    p.add_argument("--profile-every", type=int, default=200,
-                   help="Sample CUDA event/module timings every N optimizer-step-aligned iterations; 0 disables")
+    p.add_argument("--profile-every", type=int, default=50,
+                   help="Sample CUDA timing every N synchronized steps plus final step each epoch; 0 disables")
     p.add_argument("--no-diagnostics", action="store_true",
                    help="Disable extra JSONL diagnostics, module timers and printed per-class health")
     p.add_argument("--warn-iou-below", type=float, default=0.10,
@@ -170,7 +170,8 @@ def main():
         if rank == 0:
             print(f"DDP: {world} GPUs | batch/GPU={a.batch} | accumulation={a.accum} "
                   f"| effective_batch={world * a.batch * a.accum} "
-                  f"| val_images={len(selected)} | val_tiles/rank={[len(val_sampler), len(val_ds)-len(val_sampler)]} "
+                  f"| input_size={a.size} | val_images={len(selected)} "
+                  f"| val_total_tiles={len(val_ds)} | val_tiles/rank={[len(val_sampler), len(val_ds)-len(val_sampler)]} "
                   f"| params={sum(p.numel() for p in ddp.module.parameters())/1e6:.2f}M",
                   flush=True)
         for epoch in range(start, a.epochs):
@@ -194,7 +195,7 @@ def main():
                 group_size = min(a.accum, nsteps - first)
                 sync = (step + 1) % a.accum == 0 or step + 1 == nsteps
                 profile_now = bool(profiler and step > 0 and sync and
-                                   (step + 1) % a.profile_every == 0)
+                                   ((step + 1) % a.profile_every == 0 or step + 1 == nsteps))
                 if profile_now:
                     profiler.begin()
                     profiler.mark("copy_begin")
