@@ -29,6 +29,7 @@ from scripts.loveda_fast import (ROOT, NAMES, FastLoveDA, ImageShardedEvalSample
                                  find_pairs, eval_distributed, calibration_samples,
                                  tune_thresholds_logits)
 from scripts.val200_calibration import select_validation_200
+from scripts.holdout_evaluation import run_final_evaluation
 from scripts.loveda_regularization import (
     RegularizedLoveDA, top_confusions, lr_multiplier, build_discriminative_groups,
 )
@@ -79,11 +80,16 @@ def arguments():
     p.add_argument("--resnet-weights-path", default=None)
     p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--resume", default=None)
+    p.add_argument("--eval-only", default=None,
+                   help="Evaluate an existing best.pt using the saved validation split; skip training")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val-count", type=int, default=200)
     p.add_argument("--calibration-samples-per-tile", type=int, default=2048)
     p.add_argument("--no-calibrate", action="store_true")
-    p.add_argument("--evaluate-holdout", action="store_true")
+    p.add_argument("--evaluate-holdout", dest="evaluate_holdout", action="store_true", default=True,
+                   help="Automatically evaluate untouched remaining Val after training (default)")
+    p.add_argument("--no-evaluate-holdout", dest="evaluate_holdout", action="store_false",
+                   help="Skip remaining-Val evaluation (e.g. for hyperparameter search)")
     p.add_argument("--val-cache-images", type=int, default=8,
                    help="Decoded original images cached PER dataloader worker")
     p.add_argument("--train-cache-images", type=int, default=2)
@@ -93,7 +99,7 @@ def arguments():
                    help="Optional CUDA fused AdamW if available")
     p.add_argument("--log-every", type=int, default=100,
                    help="Report progress and loss components every N local GPU iterations")
-    p.add_argument("--profile-every", type=int, default=50,
+    p.add_argument("--profile-every", type=int, default=0,
                    help="Sample CUDA event/module timings every N synchronized steps or at epoch end; 0 disables")
     p.add_argument("--no-diagnostics", action="store_true",
                    help="Disable extra JSONL diagnostics, module timers and printed per-class health")
@@ -141,8 +147,14 @@ def main():
     a = arguments()
     if a.log_every < 1 or a.profile_every < 0 or not 0 <= a.warn_iou_below <= 1:
         raise ValueError("--log-every >=1, --profile-every >=0, --warn-iou-below in [0,1]")
-    if a.resume and a.init_from:
-        raise ValueError("--resume and --init-from are mutually exclusive")
+    if sum(bool(x) for x in (a.resume, a.init_from, a.eval_only)) > 1:
+        raise ValueError("Use only one of --resume, --init-from, --eval-only")
+    if a.eval_only:
+        manifest = (Path(a.output) / ("val_split_200.json" if a.val_count == 200
+                                    else f"val_split_{a.val_count}.json"))
+        if not manifest.is_file():
+            raise FileNotFoundError(
+                f"Evaluation requires original validation split manifest: {manifest}")
     if a.epochs < 1 or a.warmup_epochs < 0 or a.warmup_epochs >= a.epochs:
         raise ValueError("0 <= warmup-epochs < epochs required")
     if a.backbone_lr <= 0 or a.lr <= 0 or a.early_stop_patience < 0 or a.early_stop_min_delta < 0:
@@ -158,8 +170,9 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     # Resolve/validate --init-from BEFORE NCCL initializes. This prevents
     # a bad checkpoint from leaving the second rank waiting in a collective.
-    initial_weights = (load_init_weights(a.init_from, a.context, local_rank)
-                       if a.init_from else None)
+    weight_source = a.init_from or a.eval_only
+    initial_weights = (load_init_weights(weight_source, a.context, local_rank)
+                       if weight_source else None)
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -181,8 +194,9 @@ def main():
             output.mkdir(parents=True, exist_ok=True)
             selected, remaining = select_validation_200(
                 find_pairs(root, "val"), root, output,
-                seed=a.seed, count=a.val_count, resume=bool(a.resume))
-            (output / "args.json").write_text(json.dumps(vars(a), indent=2))
+                seed=a.seed, count=a.val_count, resume=bool(a.resume or a.eval_only))
+            (output / ("eval_args.json" if a.eval_only else "args.json")).write_text(
+                json.dumps(vars(a), indent=2))
         dist.barrier()
         if rank != 0:
             selected, remaining = select_validation_200(
@@ -214,8 +228,8 @@ def main():
 
         cfg = SDRConfig(
             num_classes=7, semantic_encoder="resnet34",
-            pretrained_semantic=(rank == 0 and not a.no_pretrained and not a.resume and not a.init_from),
-            semantic_weights_path=a.resnet_weights_path if rank == 0 and not a.resume and not a.init_from else None,
+            pretrained_semantic=(rank == 0 and not a.no_pretrained and not a.resume and not weight_source),
+            semantic_weights_path=a.resnet_weights_path if rank == 0 and not a.resume and not weight_source else None,
             context_type=a.context)
         # Every rank constructs its own model. For --init-from all ranks have
         # already loaded the same checkpoint before NCCL initialization.
@@ -268,10 +282,15 @@ def main():
             scheduler.load_state_dict(ckpt["scheduler"])
             scaler.load_state_dict(ckpt["scaler"])
             start, best, stale = ckpt["epoch"] + 1, ckpt["best_miou"], ckpt.get("early_stop_stale", 0)
+        if a.eval_only:
+            start = a.epochs  # Skip training entirely; final evaluation uses supplied checkpoint.
+            if rank == 0:
+                print(f"[EVAL-ONLY] checkpoint={a.eval_only}; training skipped", flush=True)
         if rank == 0:
             print(f"DDP: {world} GPUs | batch/GPU={a.batch} | accumulation={a.accum} "
                   f"| effective_batch={world * a.batch * a.accum} "
-                  f"| val_images={len(selected)} | val_tiles/rank={[len(val_sampler), len(val_ds)-len(val_sampler)]} "
+                  f"| val_images={len(selected)} | val_total_tiles={len(val_ds)} "
+                  f"| val_tiles/rank={[len(val_sampler), len(val_ds)-len(val_sampler)]} "
                   f"| params={sum(p.numel() for p in ddp.module.parameters())/1e6:.2f}M "
                   f"| augmentation={a.augment} | focus={a.focus_prob:.2f} "
                   f"| backbone_lr={a.backbone_lr:g} | new_lr={a.lr:g}",
@@ -491,67 +510,19 @@ def main():
                 break
             dist.barrier()  # Do not let next epoch start while rank0 saves.
 
-        if not a.no_calibrate and (output / "best.pt").exists():
-            calibration_started = time.perf_counter()
-            best_state = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
-            ddp.module.load_state_dict(best_state["model"])
-            ddp.module.eval()
-            local_logits, local_labels = calibration_samples(
-                ddp.module, val_dl, device,
-                per_tile=a.calibration_samples_per_tile, seed=a.seed + rank,
-                channels_last=a.channels_last)
-            gathered = [None] * world if rank == 0 else None
-            # Gather samples once, not dense probability maps after every tile.
-            dist.gather_object((local_logits, local_labels), gathered, dst=0)
-            thresholds = torch.ones(7, device=device)
-            if rank == 0:
-                logits = np.concatenate([v[0] for v in gathered], axis=0)
-                targets = np.concatenate([v[1] for v in gathered], axis=0)
-                tuned, fit = tune_thresholds_logits(logits, targets, device=device)
-                thresholds.copy_(torch.as_tensor(tuned, dtype=torch.float32, device=device))
-            dist.broadcast(thresholds, src=0)
-            if rank == 0 and not a.no_diagnostics:
-                diag.write("calibration_fit", samples=int(fit["sampled_pixels"]),
-                           raw_sample_miou=float(fit["raw_sample_miou"]),
-                           tuned_sample_miou=float(fit["tuned_sample_miou"]),
-                           thresholds=[round(float(v),4) for v in thresholds.cpu().tolist()])
-            evaluated = eval_distributed(ddp.module, val_dl, device,
-                                          thresholds=thresholds,
-                                          channels_last=a.channels_last)
-            result = None
-            if rank == 0:
-                result = {
-                    "selected_images": len(selected),
-                    "untouched_holdout_images": len(remaining),
-                    "thresholds": dict(zip(NAMES, [float(v) for v in thresholds.cpu().tolist()])),
-                    "threshold_array": [float(v) for v in thresholds.cpu().tolist()],
-                    "fit": fit, "selected_200": evaluated,
-                    "rule": "argmax(logits-log(class_thresholds))",
-                    "note": "Decision thresholds fitted on selected 200 Val images; not test performance.",
-                }
-            if a.evaluate_holdout and remaining:
-                holdout_ds = FastLoveDA(remaining, a.size, False,
-                                         cache_size=a.val_cache_images)
-                holdout_sampler = ImageShardedEvalSampler(holdout_ds, rank, world)
-                holdout_dl = make_loader(holdout_ds, 1, a.workers, holdout_sampler,
-                                         timeout_seconds=a.loader_timeout_seconds)
-                holdout_stats = eval_distributed(ddp.module, holdout_dl, device,
-                                                  thresholds=thresholds,
-                                                  channels_last=a.channels_last)
-                if rank == 0:
-                    result["remaining_val_holdout"] = holdout_stats
-            if rank == 0:
-                (output / "calibration.json").write_text(json.dumps(result, indent=2))
-                print("Saved calibration.json (multi-GPU Val + holdout evaluation)", flush=True)
-                if not a.no_diagnostics:
-                    elapsed = round(time.perf_counter()-calibration_started,2)
-                    diag.write("calibration_complete", elapsed_s=elapsed,
-                               calibrated_miou=evaluated["calibrated"]["miou"],
-                               raw_miou=evaluated["argmax"]["miou"])
-                    print(f"[CALIB] elapsed={elapsed:.1f}s, "
-                          f"raw_mIoU={evaluated['argmax']['miou']:.4f}, "
-                          f"tuned_mIoU={evaluated['calibrated']['miou']:.4f}", flush=True)
-            dist.barrier()
+        # This path is entered by BOTH ranks, including after early stopping.
+        # Keep model/threshold selection on selected 200 images; holdout is scored once.
+        eval_checkpoint = Path(a.eval_only) if a.eval_only else output / "best.pt"
+        if not eval_checkpoint.is_file():
+            raise FileNotFoundError(f"Expected best checkpoint for final evaluation: {eval_checkpoint}")
+        if not a.no_calibrate or a.evaluate_holdout:
+            run_final_evaluation(
+                model=ddp.module, args=a, rank=rank, world=world, device=device,
+                output=output, checkpoint=eval_checkpoint,
+                selected=selected, remaining=remaining, val_loader=val_dl,
+                diagnostics=diag if rank == 0 and not a.no_diagnostics else None,
+            )
+
     finally:
         if "hang_log" in locals() and hang_log is not None:
             faulthandler.cancel_dump_traceback_later()
