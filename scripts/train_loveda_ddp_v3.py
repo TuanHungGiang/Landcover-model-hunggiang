@@ -7,11 +7,13 @@ LoveDA labels, and the fixed 200-image validation and holdout protocol.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import random
 import sys
 import time
+from datetime import timedelta
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
@@ -47,6 +49,14 @@ def arguments():
     p.add_argument("--batch", type=int, default=8, help="Per-GPU batch size")
     p.add_argument("--accum", type=int, default=2, help="Accumulation per GPU")
     p.add_argument("--workers", type=int, default=2, help="Dataloader workers PER GPU")
+    p.add_argument("--loader-timeout-seconds", type=int, default=120,
+                   help="Per-batch timeout when workers>0 (0 disables)")
+    p.add_argument("--hang-dump-seconds", type=int, default=180,
+                   help="Dump rank's Python stacks periodically if process stalls (0 disables)")
+    p.add_argument("--heartbeat-every", type=int, default=25,
+                   help="Log both ranks before data fetch and after step every N iterations (0 disables)")
+    p.add_argument("--ddp-timeout-seconds", type=int, default=600,
+                   help="NCCL process-group collective timeout; use 300 for faster debugging")
     p.add_argument("--lr", type=float, default=2e-4, help="LR for newly initialized modules")
     p.add_argument("--backbone-lr", type=float, default=5e-5,
                    help="Lower LR for ImageNet-pretrained ResNet34")
@@ -92,12 +102,19 @@ def arguments():
     return p.parse_args()
 
 
-def make_loader(ds, batch, workers, sampler=None, *, shuffle=False):
+def make_loader(ds, batch, workers, sampler=None, *, shuffle=False, timeout_seconds=120):
     kwargs = dict(batch_size=batch, num_workers=workers, pin_memory=True,
                   sampler=sampler, shuffle=shuffle and sampler is None)
     if workers > 0:
-        kwargs.update(persistent_workers=True, prefetch_factor=2)
+        kwargs.update(persistent_workers=True, prefetch_factor=2,
+                      timeout=timeout_seconds)
     return DataLoader(ds, **kwargs)
+
+
+def heartbeat(rank: int, epoch: int, step: int, nsteps: int, phase: str) -> None:
+    """Rank-specific progress marker; intentionally never calls a DDP collective."""
+    print(f"[HEARTBEAT] rank={rank} epoch={epoch} step={step}/{nsteps} "
+          f"phase={phase} unix={time.time():.3f}", flush=True)
 
 
 def load_init_weights(path: str, context: str, rank: int):
@@ -133,6 +150,9 @@ def main():
     focus_classes = tuple(int(part) for part in a.focus_classes.split(",") if part.strip())
     if a.batch < 1 or a.accum < 1 or a.workers < 0:
         raise ValueError("--batch/--accum must be positive, --workers nonnegative")
+    if min(a.loader_timeout_seconds, a.hang_dump_seconds,
+           a.heartbeat_every) < 0 or a.ddp_timeout_seconds < 60:
+        raise ValueError("Timeouts/heartbeat must be >=0 and DDP timeout >=60 seconds")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("Select Kaggle accelerator 2 x Tesla T4")
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -144,7 +164,8 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     # Explicit mapping avoids NCCL guessing the device for barrier/all-reduce.
-    dist.init_process_group(backend="nccl", init_method="env://", device_id=device)
+    dist.init_process_group(backend="nccl", init_method="env://", device_id=device,
+                            timeout=timedelta(seconds=a.ddp_timeout_seconds))
     rank, world = dist.get_rank(), dist.get_world_size()
     if world != 2:
         dist.destroy_process_group()
@@ -168,6 +189,13 @@ def main():
                 find_pairs(root, "val"), root, output,
                 seed=a.seed, count=a.val_count, resume=True)
 
+        # Both ranks record their own blocking Python stacks, even if torchrun
+        # later terminates the process due to a NCCL watchdog timeout.
+        hang_log = None
+        if a.hang_dump_seconds:
+            hang_log = (output / f"hang_stacks_rank{rank}.log").open("a", encoding="utf-8")
+            faulthandler.dump_traceback_later(a.hang_dump_seconds,
+                                             repeat=True, file=hang_log)
         diag = DiagnosticsWriter(output, rank, enabled=not a.no_diagnostics)
         train_ds = RegularizedLoveDA(
             find_pairs(root, "train"), a.size, True,
@@ -177,10 +205,12 @@ def main():
         )
         train_sampler = DistributedSampler(train_ds, num_replicas=world,
                                            rank=rank, shuffle=True, seed=a.seed)
-        train_dl = make_loader(train_ds, a.batch, a.workers, train_sampler)
+        train_dl = make_loader(train_ds, a.batch, a.workers, train_sampler,
+                               timeout_seconds=a.loader_timeout_seconds)
         val_ds = FastLoveDA(selected, a.size, False, cache_size=a.val_cache_images)
         val_sampler = ImageShardedEvalSampler(val_ds, rank, world)
-        val_dl = make_loader(val_ds, 1, a.workers, val_sampler)
+        val_dl = make_loader(val_ds, 1, a.workers, val_sampler,
+                             timeout_seconds=a.loader_timeout_seconds)
 
         cfg = SDRConfig(
             num_classes=7, semantic_encoder="resnet34",
@@ -270,7 +300,20 @@ def main():
             start_train = time.perf_counter()
             fetch_start = time.perf_counter()
             loader_wait_sum, loader_wait_max = 0.0, 0.0
-            for step, (image, mask) in enumerate(train_dl):
+            train_iterator = iter(train_dl)
+            for step in range(nsteps):
+                trace_now = (a.heartbeat_every > 0 and
+                             (step % a.heartbeat_every == 0 or step == nsteps - 1))
+                if trace_now:
+                    heartbeat(rank, epoch + 1, step + 1, nsteps, "fetch_start")
+                try:
+                    image, mask = next(train_iterator)
+                except Exception as exc:
+                    print(f"[RANK_FAILURE] rank={rank} epoch={epoch+1} "
+                          f"step={step+1}/{nsteps} fetch_error={exc!r}", flush=True)
+                    raise
+                if trace_now:
+                    heartbeat(rank, epoch + 1, step + 1, nsteps, "fetch_done")
                 loader_wait = time.perf_counter() - fetch_start
                 loader_wait_sum += loader_wait
                 loader_wait_max = max(loader_wait_max, loader_wait)
@@ -362,8 +405,12 @@ def main():
                               f"loader_wait={progress['avg_loader_wait_ms']:.1f}ms "
                               f"peakVRAM={progress['peak_allocated_gib']:.2f}GiB "
                               f"AMP={progress['amp_scale']:.0f}", flush=True)
+                if trace_now:
+                    heartbeat(rank, epoch + 1, step + 1, nsteps, "step_complete")
                 fetch_start = time.perf_counter()
+            heartbeat(rank, epoch + 1, nsteps, nsteps, "epoch_loss_allreduce_enter")
             dist.all_reduce(loss_total, op=dist.ReduceOp.SUM)
+            heartbeat(rank, epoch + 1, nsteps, nsteps, "epoch_loss_allreduce_exit")
             train_time = time.perf_counter() - start_train
             # All ranks evaluate disjoint original images; confusion allreduce ONCE.
             start_val = time.perf_counter()
@@ -486,7 +533,8 @@ def main():
                 holdout_ds = FastLoveDA(remaining, a.size, False,
                                          cache_size=a.val_cache_images)
                 holdout_sampler = ImageShardedEvalSampler(holdout_ds, rank, world)
-                holdout_dl = make_loader(holdout_ds, 1, a.workers, holdout_sampler)
+                holdout_dl = make_loader(holdout_ds, 1, a.workers, holdout_sampler,
+                                         timeout_seconds=a.loader_timeout_seconds)
                 holdout_stats = eval_distributed(ddp.module, holdout_dl, device,
                                                   thresholds=thresholds,
                                                   channels_last=a.channels_last)
@@ -505,6 +553,9 @@ def main():
                           f"tuned_mIoU={evaluated['calibrated']['miou']:.4f}", flush=True)
             dist.barrier()
     finally:
+        if "hang_log" in locals() and hang_log is not None:
+            faulthandler.cancel_dump_traceback_later()
+            hang_log.close()
         if "profiler" in locals() and profiler is not None:
             profiler.close()
         dist.destroy_process_group()
