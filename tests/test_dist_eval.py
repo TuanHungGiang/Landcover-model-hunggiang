@@ -51,3 +51,46 @@ def test_multi_process_equal_single_process(tmp_path):
     actual = json.loads(Path(result_path).read_text())
     assert actual["argmax"]["confusion"] == expected["argmax"]["confusion"]
     assert actual["calibrated"]["confusion"] == expected["calibrated"]["confusion"]
+
+
+
+class _BatchNormDummy(torch.nn.Module):
+    def __init__(self, rank):
+        super().__init__()
+        self.bn = torch.nn.BatchNorm2d(1, affine=False)
+        self.bn.eval()
+        with torch.no_grad():
+            self.bn.running_mean.fill_(float(rank * 10))
+
+    def forward(self, x):
+        val = self.bn(x[:, :1])
+        return {"logits": torch.cat([val, -val, *[torch.zeros_like(val) for _ in range(5)]], dim=1)}
+
+
+def _bn_worker(rank, world, init_file, result_file):
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        model = _BatchNormDummy(rank)
+        image = torch.ones((3, 8, 8), dtype=torch.float32)
+        mask = torch.zeros((8, 8), dtype=torch.int64)
+        loader = torch.utils.data.DataLoader([(image, mask)], batch_size=1)
+        result = eval_distributed(model, loader, torch.device("cpu"))
+        if rank == 1:
+            Path(result_file).write_text(json.dumps({
+                "mean": float(model.bn.running_mean.item()),
+                "miou": result["miou"],
+                "confusion": result["confusion"],
+            }))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_bn_buffers_broadcast_before_distributed_validation(tmp_path):
+    """All ranks must evaluate using the same BatchNorm running statistics."""
+    init_file = str(tmp_path / "bn_init")
+    result_file = str(tmp_path / "bn_result.json")
+    mp.spawn(_bn_worker, args=(2, init_file, result_file), nprocs=2, join=True)
+    result = json.loads(Path(result_file).read_text())
+    assert result["mean"] == 0.0
+    assert result["confusion"][0][0] == 2 * 8 * 8
+    assert result["miou"] == 1.0

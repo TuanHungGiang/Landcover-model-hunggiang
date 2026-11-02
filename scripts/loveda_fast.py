@@ -182,9 +182,27 @@ def confusion_metrics(matrix: torch.Tensor) -> dict:
 
 
 @torch.no_grad()
+def synchronize_eval_buffers(model) -> None:
+    """Synchronize rank-0 BN running stats and other buffers before DDP evaluation.
+
+    DDP broadcasts buffers *before* training forwards, but BatchNorm then
+    updates them locally on each rank. Since validation calls ddp.module
+    directly (not DDP), broadcasts are needed to evaluate one consistent model.
+    All ranks must call this helper in identical collective order.
+    """
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+    for buffer in model.buffers():
+        if buffer.numel() > 0:
+            dist.broadcast(buffer, src=0)
+
+
+@torch.no_grad()
 def eval_distributed(model, loader, device: torch.device, thresholds=None, sync: bool = True,
                      channels_last: bool = False):
     """Both ranks evaluate separate full images; only TWO allreduces at end."""
+    if sync:
+        synchronize_eval_buffers(model)
     model.eval()
     raw = torch.zeros((7, 7), device=device, dtype=torch.int64)
     adjusted = torch.zeros_like(raw) if thresholds is not None else None
