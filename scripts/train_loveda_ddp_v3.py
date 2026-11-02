@@ -100,6 +100,26 @@ def make_loader(ds, batch, workers, sampler=None, *, shuffle=False):
     return DataLoader(ds, **kwargs)
 
 
+def load_init_weights(path: str, context: str, rank: int):
+    """Preflight a v2 best.pt on CPU before creating the NCCL process group."""
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Fine-tuning checkpoint not found: {checkpoint_path}")
+    print(f"[rank{rank}][INIT] reading {checkpoint_path} "
+          f"({checkpoint_path.stat().st_size / 2**20:.1f} MiB)", flush=True)
+    incoming = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(incoming, dict) or not isinstance(incoming.get("model"), dict):
+        raise ValueError("--init-from must contain a model state_dict")
+    previous_config = incoming.get("model_config", {})
+    if previous_config.get("architecture_version") != "r34_layer4_bi_v2":
+        raise ValueError("--init-from must be a layer4 bidirectional v2 checkpoint")
+    if previous_config.get("context_type") != context:
+        raise ValueError("--init-from context_type must match --context")
+    print(f"[rank{rank}][INIT] checkpoint validated "
+          f"(source epoch={incoming.get('epoch', 'unknown')})", flush=True)
+    return incoming["model"]
+
+
 def main():
     a = arguments()
     if a.log_every < 1 or a.profile_every < 0 or not 0 <= a.warn_iou_below <= 1:
@@ -116,9 +136,15 @@ def main():
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("Select Kaggle accelerator 2 x Tesla T4")
     local_rank = int(os.environ["LOCAL_RANK"])
+    # Resolve/validate --init-from BEFORE NCCL initializes. This prevents
+    # a bad checkpoint from leaving the second rank waiting in a collective.
+    initial_weights = (load_init_weights(a.init_from, a.context, local_rank)
+                       if a.init_from else None)
+
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dist.init_process_group(backend="nccl", init_method="env://")
+    # Explicit mapping avoids NCCL guessing the device for barrier/all-reduce.
+    dist.init_process_group(backend="nccl", init_method="env://", device_id=device)
     rank, world = dist.get_rank(), dist.get_world_size()
     if world != 2:
         dist.destroy_process_group()
@@ -161,22 +187,18 @@ def main():
             pretrained_semantic=(rank == 0 and not a.no_pretrained and not a.resume and not a.init_from),
             semantic_weights_path=a.resnet_weights_path if rank == 0 and not a.resume and not a.init_from else None,
             context_type=a.context)
-        # Rank 0 downloads pretrained weights; the DDP constructor broadcasts its state.
-        if rank == 0:
-            raw = SDRMambaNet(cfg)
-            if a.init_from:
-                incoming = torch.load(a.init_from, map_location="cpu", weights_only=False)
-                if incoming.get("model_config", {}).get("architecture_version") != "r34_layer4_bi_v2":
-                    raise ValueError("--init-from must be a training checkpoint for layer4 bidirectional v2")
-                if incoming.get("model_config", {}).get("context_type") != a.context:
-                    raise ValueError("--init-from context_type must match --context")
-                raw.load_state_dict(incoming["model"], strict=True)
-                print(f"[FINETUNE] initialized from {a.init_from} "
-                      f"(source epoch={incoming.get('epoch', 'unknown')}); "
+        # Every rank constructs its own model. For --init-from all ranks have
+        # already loaded the same checkpoint before NCCL initialization.
+        # DDP still broadcasts rank0 weights/buffers on construction.
+        print(f"[rank{rank}][INIT] constructing ResNet34+dual-branch model", flush=True)
+        raw = SDRMambaNet(cfg)
+        if initial_weights is not None:
+            raw.load_state_dict(initial_weights, strict=True)
+            del initial_weights
+            if rank == 0:
+                print(f"[FINETUNE] initialized from {a.init_from}; "
                       "optimizer/scheduler reset", flush=True)
-        dist.barrier()
-        if rank != 0:
-            raw = SDRMambaNet(cfg)
+        print(f"[rank{rank}][INIT] moving model to {device}", flush=True)
         raw = raw.to(device)
         if a.channels_last:
             raw = raw.to(memory_format=torch.channels_last)
@@ -383,12 +405,12 @@ def main():
                              train_seconds=round(train_time, 2),
                              val_seconds=round(val_time, 2),
                              train_images_per_second=round((len(train_ds) / max(train_time, 1e-9)), 2))
+                stats["lr_pretrained"] = epoch_lrs[0]
+                stats["lr_new"] = epoch_lrs[1]
                 print(f"Epoch {epoch+1}/{a.epochs}: loss={stats['train_loss']:.4f} "
                       f"mIoU={stats['miou']:.4f} OA={stats['oa']:.4f} "
                       f"train={train_time:.1f}s val={val_time:.1f}s "
                       f"lr_resnet={stats['lr_pretrained']:.2g} lr_new={stats['lr_new']:.2g}", flush=True)
-                stats["lr_pretrained"] = epoch_lrs[0]
-                stats["lr_new"] = epoch_lrs[1]
                 stats["early_stop_stale_before_update"] = stale
                 with (output / "history.jsonl").open("a") as fp:
                     fp.write(json.dumps(stats) + "\n")
