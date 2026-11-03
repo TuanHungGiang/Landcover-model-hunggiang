@@ -37,4 +37,5 @@ jobs:
             tests/test_hcr_model.py \
             tests/test_memory_checkpoint.py \
             tests/test_hcr_diagnostics.py \
-            tests/test_checkpoint_io.py
+            tests/test_checkpoint_io.py \
+            tests/test_hcr_validation_serialization.py

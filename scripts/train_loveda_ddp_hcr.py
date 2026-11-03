@@ -221,7 +221,10 @@ def validate_hcr_heads(model, loader, device, *, channels_last=False):
                risk_mean=float(risk_sum[0]/risk_sum[3].clamp_min(1)),
                actual_error=float(risk_sum[1]/risk_sum[3].clamp_min(1)),
                risk_brier=float(risk_sum[2]/risk_sum[3].clamp_min(1)))
-    return heads["final"],heads,graph
+    # Return a separate dictionary: the caller attaches the full heads dict
+    # to stats["head_metrics"]. Returning heads["final"] by reference would
+    # create stats -> head_metrics -> final -> stats and break json.dumps.
+    return dict(heads["final"]), heads, graph
 
 
 def main():

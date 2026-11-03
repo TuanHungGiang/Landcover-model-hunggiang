@@ -76,3 +76,21 @@ contains model weights only, and is NOT a full optimizer resume checkpoint.
 To locate problems, grep for [CHECKPOINT], [CHECKPOINT-ERROR], [CHECKPOINT-CONTROL],
 [VAL-HCR], [HCR-STEP] and [RANK_FAILURE]. Avoid using --evaluate-holdout on
 every research iteration.
+
+
+## Circular-reference regression fix (epoch 1)
+
+The first diagnostic run revealed an actual Python serialization error:
+
+```
+[CHECKPOINT-ERROR] rank=0 epoch=1 ValueError: Circular reference detected
+```
+
+Root cause: `validate_hcr_heads()` returned `heads["final"]` **by reference**
+as `stats`; later `stats["head_metrics"] = heads` introduced a reference
+cycle via `heads["final"]` back to `stats`.
+
+The updated return uses `dict(heads["final"])` (a distinct dict). New CPU
+regression test executes the full HCR head validation path and explicitly writes
+the same JSON history structure; it failed on the prior implementation. The
+fix does not alter training predictions, architecture, or gradients.
