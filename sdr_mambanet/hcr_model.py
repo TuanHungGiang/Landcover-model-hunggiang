@@ -16,16 +16,18 @@ from .models import SDRConfig, SDRMambaNet
 
 @dataclass
 class HCRConfig(SDRConfig):
-    architecture_version: str = "r34_layer4_bi_hcr_v1"
+    architecture_version: str = "r34_layer4_bi_hcr_v2"
     hierarchy_mix: float = 0.25
     graph_steps: int = 3
     graph_lambda: float = 0.5
     graph_eta: float = 0.5
     graph_channels: int = 24
     memory_saver: bool = False
+    hierarchy_ramp_epochs: int = 6
 
 
-def build_confusion_groups(confusion: torch.Tensor, min_score: float = 0.02):
+def build_confusion_groups(confusion: torch.Tensor, min_score: float = 0.02,
+                           min_reciprocal: float = 0.015):
     """Disjoint pairs chosen from *training* confusion, remaining classes singleton.
 
     Symmetric per-class normalization prevents frequent classes dominating.
@@ -33,8 +35,8 @@ def build_confusion_groups(confusion: torch.Tensor, min_score: float = 0.02):
     """
     if confusion.ndim != 2 or confusion.shape[0] != confusion.shape[1]:
         raise ValueError("Expected square confusion matrix")
-    if not 0 <= min_score <= 1:
-        raise ValueError("min_score must be in [0,1]")
+    if not 0 <= min_score <= 1 or not 0 <= min_reciprocal <= 1:
+        raise ValueError("min_score and min_reciprocal must be in [0,1]")
     n = confusion.shape[0]
     counts = confusion.double().sum(1).clamp_min(1.0)
     rates = confusion.double() / counts[:, None]
@@ -48,6 +50,9 @@ def build_confusion_groups(confusion: torch.Tensor, min_score: float = 0.02):
     for score, i, j in options:
         if score < min_score:
             break
+        # A unilateral error does not imply a useful shared hierarchy.
+        if min(float(rates[i, j]), float(rates[j, i])) < min_reciprocal:
+            continue
         if i not in used and j not in used:
             groups.append([i, j])
             used.update((i, j))
@@ -123,7 +128,10 @@ class ReliabilityGraphRefiner(nn.Module):
                                 hier_probs.detach(), js.detach()), dim=1)
         risk_logits = self.risk_head(risk_input).float()
         risk = risk_logits.sigmoid()
-        anchor = 0.2 + (1.0 - risk)  # strictly positive, avoids singular solve
+        # Risk is supervised on the *pre-graph mixed* predictions. Protect
+        # confident, low-risk pixels; allow high-risk nodes to change.
+        confidence = mixed_probs.float().amax(1, keepdim=True).detach()
+        anchor = 0.25 + (1.0 - risk) * (1.0 + confidence)
         z0 = mixed_probs.float().clamp_min(1e-6).log()
         z = z0
         weights = []
@@ -132,13 +140,16 @@ class ReliabilityGraphRefiner(nn.Module):
             sd_n, mask = self._shift_valid(sd, dy, dx)
             ss_n, _ = self._shift_valid(ss, dy, dx)
             group_n, _ = self._shift_valid(group_probs.float(), dy, dx)
-            risk_n, _ = self._shift_valid(risk, dy, dx)
+            mixed_n, _ = self._shift_valid(mixed_probs.float(), dy, dx)
             sim_d = (sd * sd_n).sum(1, keepdim=True).clamp(-1, 1)
             sim_s = (ss * ss_n).sum(1, keepdim=True).clamp(-1, 1)
             visual = torch.exp(-0.7 * ((1 - sim_d) + (1 - sim_s)))
+            # In v1 the graph became MORE permissive when risk rose, even
+            # across semantic boundaries. v2 keeps class consistency as a
+            # gate independent of risk, reducing background leakage.
             same_group = (group_probs.float() * group_n).sum(1, keepdim=True)
-            loosen = torch.maximum(risk, risk_n)
-            agreement = 0.10 + (1 - loosen) * same_group + loosen
+            same_class = (mixed_probs.float() * mixed_n).sum(1, keepdim=True)
+            agreement = 0.05 + 0.75 * same_class + 0.20 * same_group
             wij = visual * agreement * mask
             weights.append((dy, dx, wij))
             degree = degree + wij
@@ -158,10 +169,10 @@ class HCRSDRNet(SDRMambaNet):
 
     def __init__(self, cfg: HCRConfig | None = None):
         cfg = HCRConfig() if cfg is None else cfg
-        if cfg.architecture_version != "r34_layer4_bi_hcr_v1":
+        if cfg.architecture_version != "r34_layer4_bi_hcr_v2":
             raise ValueError("Wrong HCR architecture version")
-        if not 0 <= cfg.hierarchy_mix <= 1:
-            raise ValueError("hierarchy_mix must be between 0 and 1")
+        if not 0 <= cfg.hierarchy_mix <= 1 or cfg.hierarchy_ramp_epochs < 1:
+            raise ValueError("Invalid hierarchy_mix / hierarchy_ramp_epochs")
         # The parent builds the exact original feature extractor and decoder.
         base_names = {f.name for f in fields(SDRConfig)}
         base_args = {k: v for k, v in asdict(cfg).items() if k in base_names}
@@ -184,13 +195,24 @@ class HCRSDRNet(SDRMambaNet):
         )
         self.register_buffer("class_groups", torch.arange(k, dtype=torch.long))
         self.register_buffer("class_train_confusion", torch.zeros((k, k), dtype=torch.long))
+        # Persisted in checkpoints and broadcast to all DDP ranks.
+        # Zero before confusion calibration, ramp to one across epochs.
+        self.register_buffer("hierarchy_strength", torch.tensor(0.0))
 
     @torch.no_grad()
-    def configure_groups_from_training(self, confusion: torch.Tensor, min_score: float = 0.02):
-        mapping, groups = build_confusion_groups(confusion.detach().cpu(), min_score)
+    def configure_groups_from_training(self, confusion: torch.Tensor, min_score: float = 0.02,
+                                       min_reciprocal: float = 0.015):
+        mapping, groups = build_confusion_groups(confusion.detach().cpu(), min_score,
+                                                min_reciprocal=min_reciprocal)
         self.class_groups.copy_(mapping.to(self.class_groups.device))
         self.class_train_confusion.copy_(confusion.to(self.class_train_confusion.device))
         return groups
+
+    @torch.no_grad()
+    def set_hierarchy_strength(self, value: float):
+        if not 0 <= value <= 1:
+            raise ValueError("hierarchy strength must be in [0,1]")
+        self.hierarchy_strength.fill_(float(value))
 
     def _hierarchy(self, fused: torch.Tensor):
         # Both heads always produce K channels. Grouping changes only
@@ -215,10 +237,11 @@ class HCRSDRNet(SDRMambaNet):
         ph8, pg8 = self._hierarchy(fused)
         pf8 = F.interpolate(flat_probs, size=fused.shape[-2:],
                             mode="bilinear", align_corners=False)
-        p08 = (1 - self.cfg.hierarchy_mix) * pf8 + self.cfg.hierarchy_mix * ph8
+        alpha = self.cfg.hierarchy_mix * self.hierarchy_strength
+        p08 = (1 - alpha) * pf8 + alpha * ph8
         ph_full = F.interpolate(ph8, size=x.shape[-2:],
                                 mode="bilinear", align_corners=False)
-        p0full = (1 - self.cfg.hierarchy_mix) * flat_probs + self.cfg.hierarchy_mix * ph_full
+        p0full = (1 - alpha) * flat_probs + alpha * ph_full
         graph_inputs = (maps["d8"], maps["s16"], fused, pf8, ph8, pg8, p08)
         delta, risk_logits = (checkpoint_module(self.graph_refiner, *graph_inputs)
                               if self.cfg.memory_saver else self.graph_refiner(*graph_inputs))
@@ -226,7 +249,9 @@ class HCRSDRNet(SDRMambaNet):
                                    mode="bilinear", align_corners=False)
         logits = p0full.clamp_min(1e-6).log() + correction
         result = {"logits": logits, "flat_logits": flat_logits,
-                  "hier_probs": ph8, "risk_logits": risk_logits}
+                  "hier_probs": ph8, "risk_logits": risk_logits,
+                  "mixed_logits": p0full.clamp_min(1e-6).log(),
+                  "graph_delta": delta}
         if "boundary_logits" in decoder_result:
             result["boundary_logits"] = decoder_result["boundary_logits"]
         return result

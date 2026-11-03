@@ -42,7 +42,9 @@ def predictions_from_output(out, hierarchy_mix):
     flat_prob = out["flat_logits"].float().softmax(1)
     hier_prob = F.interpolate(out["hier_probs"].float(), flat_prob.shape[-2:],
                               mode="bilinear", align_corners=False)
-    mixed_prob = (1-hierarchy_mix)*flat_prob + hierarchy_mix*hier_prob
+    # v2 persists the actual pre-graph mixed distribution; v1 reconstructs it.
+    mixed_prob = (out["mixed_logits"].float().exp() if "mixed_logits" in out else
+                  (1-hierarchy_mix)*flat_prob + hierarchy_mix*hier_prob)
     return {
         "flat": flat_prob.argmax(1),
         "hierarchy": hier_prob.argmax(1),
@@ -257,8 +259,8 @@ def main():
     ckpt_path=Path(a.checkpoint) if a.checkpoint else run/"best.pt"
     ckpt=torch.load(ckpt_path,map_location="cpu",weights_only=True)
     conf=dict(ckpt["model_config"])
-    if conf.get("architecture_version")!="r34_layer4_bi_hcr_v1":
-        raise ValueError("Expected HCR v1 checkpoint")
+    if conf.get("architecture_version") not in ("r34_layer4_bi_hcr_v1", "r34_layer4_bi_hcr_v2"):
+        raise ValueError("Expected HCR v1 or v2 checkpoint")
     conf.update(pretrained_semantic=False,semantic_weights_path=None,memory_saver=False)
     cfg=HCRConfig(**conf)
     device=torch.device(a.device)
@@ -301,7 +303,8 @@ def main():
             row[tag+"_fixed"]=update["corrected"]
             row[tag+"_broken"]=update["damaged"]
             row[tag+"_net"]=update["corrected"]-update["damaged"]
-        risk.add(out["risk_logits"],preds["flat"],gt,preds["mixed"],preds["final"])
+        risk_source = preds["mixed"] if cfg.architecture_version.endswith("v2") else preds["flat"]
+        risk.add(out["risk_logits"],risk_source,gt,preds["mixed"],preds["final"])
         rows.append(row)
         if (index+1)%a.progress_every==0 or index+1==limit:
             print(f"[HCR-DIAG] tiles {index+1}/{limit}",flush=True)

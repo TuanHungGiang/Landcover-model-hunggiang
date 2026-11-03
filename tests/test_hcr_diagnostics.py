@@ -25,6 +25,10 @@ def test_predictions_reproduce_hcr_mixture():
     preds=predictions_from_output({"flat_logits":logits,"hier_probs":h,
                                    "logits":mixture.log()},.5)
     assert torch.equal(preds["mixed"],preds["final"])
+    newer=predictions_from_output({"flat_logits":logits,"hier_probs":h,
+                                   "mixed_logits":(.9*logits.softmax(1)+.1*h).log(),
+                                   "logits":mixture.log()},.5)
+    assert int(newer["mixed"])==0
 
 
 def test_risk_ranking():

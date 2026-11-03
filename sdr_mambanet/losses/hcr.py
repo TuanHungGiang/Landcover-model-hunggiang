@@ -35,7 +35,9 @@ class HCRSegmentationLoss(nn.Module):
         else:
             hier_loss = out["hier_probs"].sum() * 0.
         with torch.no_grad():
-            wrong = (flat.detach().argmax(1) != target) & valid
+            # Train risk on the exact pre-graph prediction it will refine,
+            # rather than on the flat head which may disagree with hierarchy.
+            wrong = (out["mixed_logits"].detach().argmax(1) != target) & valid
             size = out["risk_logits"].shape[-2:]
             count = F.adaptive_avg_pool2d(valid[:, None].float(), size)
             errors = F.adaptive_avg_pool2d(wrong[:, None].float(), size)

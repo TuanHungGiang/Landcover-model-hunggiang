@@ -97,3 +97,19 @@ def test_memory_saver_checkpoint_backward_and_bn_stats():
     assert model.backbone.semantic.layer3[0].conv1.weight.grad is not None
     assert model.graph_refiner.detail_proj.weight.grad is not None
     assert model.backbone.detail.stage4[0].spatial.branches["region"][1].weight.grad is not None
+
+def test_v2_rejects_one_way_confusion_and_ramps_hierarchy():
+    conf = torch.eye(7,dtype=torch.long)*100
+    conf[3,6]=70
+    mapping,groups=build_confusion_groups(conf,min_score=0.02,min_reciprocal=0.015)
+    assert mapping[3]!=mapping[6], "One-way confusion must not create pair"
+    model=HCRSDRNet(HCRConfig(pretrained_semantic=False,graph_steps=1))
+    assert model.cfg.architecture_version=="r34_layer4_bi_hcr_v2"
+    assert float(model.hierarchy_strength)==0.
+    model.set_hierarchy_strength(0.75)
+    assert abs(float(model.hierarchy_strength)-0.75)<1e-6
+    cm=torch.eye(7,dtype=torch.long)*100
+    cm[0,4]=30
+    cm[4,0]=28
+    groups=model.configure_groups_from_training(cm)
+    assert any(set(g)=={0,4} for g in groups)

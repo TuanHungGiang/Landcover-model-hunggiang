@@ -49,6 +49,8 @@ def arguments():
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--group-warmup-epochs", type=int, default=3,
                    help="Freeze class groups after this training epoch (Train labels only)")
+    p.add_argument("--confusion-min-reciprocal", type=float, default=0.015)
+    p.add_argument("--hierarchy-ramp-epochs", type=int, default=6)
     p.add_argument("--confusion-min-score", type=float, default=0.02,
                    help="Minimum symmetric conditional confusion to join a class pair")
     p.add_argument("--hierarchy-mix", type=float, default=0.25)
@@ -173,6 +175,8 @@ def main():
         raise ValueError("0 <= warmup-epochs < epochs required")
     if not (1 <= a.group_warmup_epochs <= a.epochs):
         raise ValueError("1 <= group-warmup-epochs <= epochs required")
+    if not (0 <= a.confusion_min_reciprocal <= 1) or a.hierarchy_ramp_epochs < 1:
+        raise ValueError("Invalid reciprocal confusion / hierarchy ramp")
     if not (0 <= a.confusion_min_score <= 1):
         raise ValueError("--confusion-min-score must be in [0,1]")
     if not (0 <= a.hierarchy_mix <= 1 and 0 <= a.graph_eta <= 1):
@@ -255,7 +259,8 @@ def main():
             semantic_weights_path=a.resnet_weights_path if rank == 0 and not a.resume and not weight_source else None,
             context_type=a.context, hierarchy_mix=a.hierarchy_mix,
             graph_steps=a.graph_steps, graph_lambda=a.graph_lambda,
-            graph_eta=a.graph_eta, memory_saver=a.memory_saver)
+            graph_eta=a.graph_eta, memory_saver=a.memory_saver,
+             hierarchy_ramp_epochs=a.hierarchy_ramp_epochs)
         # Every rank constructs its own model. For --init-from all ranks have
         # already loaded the same checkpoint before NCCL initialization.
         # DDP still broadcasts rank0 weights/buffers on construction.
@@ -303,13 +308,13 @@ def main():
         if a.resume:
             ckpt = torch.load(a.resume, map_location="cpu", weights_only=False)
             previous = ckpt.get("model_config", {})
-            if ckpt.get("training_recipe_version") != "hcr_v1":
+            if ckpt.get("training_recipe_version") != "hcr_v2":
                 raise ValueError("Only resume HCR last.pt; use --init-from for baseline checkpoints")
             prev_args = ckpt.get("training_args", {})
-            for key in ("epochs", "seed", "size", "batch", "accum", "memory_saver", "augment", "focus_prob", "focus_classes", "zoom_min", "zoom_max", "warmup_epochs", "min_lr_ratio", "lr", "backbone_lr", "group_warmup_epochs", "confusion_min_score", "hierarchy_mix", "graph_steps", "graph_lambda", "graph_eta", "hierarchy_weight", "flat_weight", "risk_weight"):
+            for key in ("epochs", "seed", "size", "batch", "accum", "memory_saver", "confusion_min_reciprocal", "hierarchy_ramp_epochs", "augment", "focus_prob", "focus_classes", "zoom_min", "zoom_max", "warmup_epochs", "min_lr_ratio", "lr", "backbone_lr", "group_warmup_epochs", "confusion_min_score", "hierarchy_mix", "graph_steps", "graph_lambda", "graph_eta", "hierarchy_weight", "flat_weight", "risk_weight"):
                 if key in prev_args and prev_args[key] != getattr(a,key):
                     raise ValueError(f"Resume option changed: {key} ({prev_args[key]} -> {getattr(a,key)})")
-            if previous.get("architecture_version") != "r34_layer4_bi_hcr_v1":
+            if previous.get("architecture_version") != "r34_layer4_bi_hcr_v2":
                 raise ValueError("Cannot resume a non-HCR checkpoint")
             if previous.get("context_type") != a.context:
                 raise ValueError("--context must match resume checkpoint")
@@ -345,6 +350,11 @@ def main():
                            output / "best.pt")
                 (output / "best_metrics.json").write_text(json.dumps(initial, indent=2))
         for epoch in range(start, a.epochs):
+            strength = min(1.0, max(0.0, (epoch + 1 - a.group_warmup_epochs) / a.hierarchy_ramp_epochs))
+            ddp.module.set_hierarchy_strength(strength)
+            if rank == 0:
+                print(f"[HCR-SCHEDULE] epoch={epoch+1} strength={strength:.4f} "
+                      f"effective_mix={strength * a.hierarchy_mix:.4f}",flush=True)
             train_sampler.set_epoch(epoch)
             epoch_lrs = [group["lr"] for group in optimizer.param_groups]
             ddp.train()
@@ -409,6 +419,17 @@ def main():
                     loss_total.add_(loss.detach())
                     ce_total.add_(loss_parts["ce"].detach())
                     dice_total.add_(loss_parts["dice"].detach())
+                    if not a.no_diagnostics and ((step+1) % a.log_every == 0 or step+1 == nsteps):
+                        with torch.no_grad():
+                            mask_ok = mask != 255
+                            change_pct = 100 * (((out["mixed_logits"].argmax(1) != out["logits"].argmax(1)) & mask_ok).sum().float() / mask_ok.sum().clamp_min(1))
+                            hcr_diag = dict(hierarchy_ce=float(loss_parts["hierarchy"].detach()),
+                                            flat_ce=float(loss_parts["flat"].detach()),
+                                            risk_loss=float(loss_parts["risk"].detach()),
+                                            risk_mean=float(out["risk_logits"].float().sigmoid().mean()),
+                                            graph_delta_abs=float(out["graph_delta"].float().abs().mean()),
+                                            graph_changes_pct=float(change_pct),
+                                            hierarchy_conf=float(out["hier_probs"].float().amax(1).mean()))
                     if profile_now:
                         profiler.mark("forward_end")
                         profiler.mark("backward_begin")
@@ -475,6 +496,9 @@ def main():
                               f"loader_wait={progress['avg_loader_wait_ms']:.1f}ms "
                               f"peakVRAM={progress['peak_allocated_gib']:.2f}GiB "
                               f"AMP={progress['amp_scale']:.0f}", flush=True)
+                        print(f"[HCR-STEP] epoch={epoch+1} step={step+1}/{nsteps} " +
+                              " ".join(f"{key}={value:.5f}" for key,value in hcr_diag.items()),flush=True)
+                        diag.write("hcr_step", epoch=epoch+1, local_step=step+1, **hcr_diag)
                 if trace_now:
                     heartbeat(rank, epoch + 1, step + 1, nsteps, "step_complete")
                 fetch_start = time.perf_counter()
@@ -486,12 +510,14 @@ def main():
             if train_confusion is not None:
                 dist.all_reduce(train_confusion, op=dist.ReduceOp.SUM)
                 groups = ddp.module.configure_groups_from_training(
-                    train_confusion, min_score=a.confusion_min_score)
+                    train_confusion, min_score=a.confusion_min_score,
+                    min_reciprocal=a.confusion_min_reciprocal)
                 if rank == 0:
                     (output / "train_confusion_groups.json").write_text(json.dumps({
                         "epoch": epoch + 1, "groups": groups,
                         "training_confusion": train_confusion.cpu().tolist(),
                         "min_score": a.confusion_min_score,
+                        "min_reciprocal": a.confusion_min_reciprocal,
                         "note": "Calculated from training predictions and training GT only."
                     }, indent=2))
                     print(f"[HCR] class groups frozen from Train: {groups}", flush=True)
@@ -535,6 +561,8 @@ def main():
                              train_seconds=round(train_time, 2),
                              val_seconds=round(val_time, 2),
                              train_images_per_second=round((len(train_ds) / max(train_time, 1e-9)), 2))
+                stats["hierarchy_strength"] = strength
+                stats["effective_hierarchy_mix"] = a.hierarchy_mix * strength
                 stats["lr_pretrained"] = epoch_lrs[0]
                 stats["lr_new"] = epoch_lrs[1]
                 print(f"Epoch {epoch+1}/{a.epochs}: loss={stats['train_loss']:.4f} "
@@ -559,7 +587,7 @@ def main():
                 stale = 0 if stats["miou"] > previous_best + a.early_stop_min_delta else stale + 1
                 state["best_miou"] = best
                 state["early_stop_stale"] = stale
-                state["training_recipe_version"] = "hcr_v1"
+                state["training_recipe_version"] = "hcr_v2"
                 state["training_args"] = vars(a)
                 torch.save(state, output / "last.pt")
                 print(f"[EARLY_STOP] stale={stale}/{a.early_stop_patience} best_mIoU={best:.4f}",flush=True)
