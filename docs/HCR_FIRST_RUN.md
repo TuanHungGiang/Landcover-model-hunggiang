@@ -127,12 +127,11 @@ torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
 
 The allocator environment setting is optional and may help fragmentation; it
 does **not** fix genuinely insufficient GPU memory. Note: memory-saver
-recomputes encoder stages + graph during backward. It intentionally freezes
-pretrained semantic BatchNorm running statistics to avoid updating them twice
-and can increase training time. Semantic BN affine parameters still learn.
-If training ResNet34 fully from scratch (--no-pretrained), freezing randomly
-initialized BN running statistics is not recommended. Prefer the normal mode
-with --batch 1 or supply pretrained weights.
+recomputes encoder stages + graph during backward. It checkpoints all high-memory components (detail RSF blocks, ResNet stages,
+bidirectional/cross-scale/final fusion, decoder RSF, graph refinement).
+BatchNorm stays in **train mode**, and its running statistics update exactly
+once per microbatch even when forward is recomputed; it is safe with
+--no-pretrained as well. It can substantially increase training time.
 
 If still OOM at batch 1, capture the **full CUDA OOM traceback**, especially
 the free/allocated/reserved VRAM numbers and which operation triggers OOM.
@@ -141,3 +140,25 @@ means VRAM sufficiency is not guaranteed.
 
 For a truly fresh run, do not reuse an old output directory; resume only if
 all training options (including --memory-saver) match the saved checkpoint.
+
+
+### Try batch 8 / GPU (experimental, NOT T4-verified)
+
+Only after verifying new CPU tests pass and allowing for GPU VRAM headroom:
+
+```bash
+!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
+  --context conv --size 512 --batch 8 --accum 2 --workers 2 \
+  --memory-saver --epochs 100 --warmup-epochs 5 --group-warmup-epochs 10 \
+  --lr 2e-4 --backbone-lr 5e-5 --augment strong \
+  --early-stop-patience 20 --val-count 200 --seed 42 \
+  --no-evaluate-holdout \
+  --output /kaggle/working/rsf_hcrnet_batch8_checkpointing
+```
+
+Each T4 only has ~14.56 GiB usable VRAM in the reported Kaggle session.
+Memory optimizations do not guarantee batch 8 fits. Benchmark one complete
+optimizer step first; if it still OOMs, use batch 4 then 2, or preserve the
+effective batch using microbatch 1 + accumulation 16. Activation checkpointing
+does not change architecture/loss and retains train-time BatchNorm behavior.

@@ -74,20 +74,26 @@ def test_hierarchy_independent_of_class_names():
 
 
 def test_memory_saver_checkpoint_backward_and_bn_stats():
-    # All main-method paths remain trainable; ResNet BN running statistics
-    # stay fixed despite backward recomputation, RSF-reparam branches unaffected.
+    # All main-method paths remain trainable; ResNet and RSF branch BatchNorm
+    # update running stats ONCE despite recomputation in backward.
     torch.manual_seed(19)
     model = HCRSDRNet(HCRConfig(pretrained_semantic=False, memory_saver=True,
                                 graph_steps=2)).train()
     semantic_bn = model.backbone.semantic.layer1[0].bn1
     before = semantic_bn.running_mean.clone()
+    seen_before = int(semantic_bn.num_batches_tracked.item())
+    rsf_bn = model.backbone.detail.stage4[0].spatial.branches["region"][1]
+    rsf_seen_before = int(rsf_bn.num_batches_tracked.item())
     x = torch.randn(1, 3, 64, 64)
     target = torch.randint(0, 7, (1, 64, 64))
     out = model(x)
     loss = HCRSegmentationLoss()(out, target)["total"]
     assert torch.isfinite(loss)
     loss.backward()
-    torch.testing.assert_close(semantic_bn.running_mean, before, rtol=0, atol=0)
+    assert semantic_bn.training and rsf_bn.training
+    assert int(semantic_bn.num_batches_tracked.item()) == seen_before + 1
+    assert int(rsf_bn.num_batches_tracked.item()) == rsf_seen_before + 1
+    assert not torch.equal(semantic_bn.running_mean, before)
     assert model.backbone.semantic.layer3[0].conv1.weight.grad is not None
     assert model.graph_refiner.detail_proj.weight.grad is not None
     assert model.backbone.detail.stage4[0].spatial.branches["region"][1].weight.grad is not None

@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import torch
 from ..blocks.rsf_rep import RSFRepBlock
+from ..utils.checkpointing import checkpoint_module
 
 
 class LightFPNDecoder(nn.Module):
@@ -15,12 +16,14 @@ class LightFPNDecoder(nn.Module):
         self.refine = RSFRepBlock(decoder_channels, kernel_size=rep_kernel)
         self.head = nn.Conv2d(decoder_channels, num_classes, 1)
         self.boundary_head = nn.Conv2d(decoder_channels, 1, 1) if boundary_aux else None
+        self.activation_checkpointing = False
 
     def forward(self, d4: torch.Tensor, f8: torch.Tensor,
                 out_size: tuple[int, int]) -> dict[str, torch.Tensor]:
         x = F.interpolate(self.lat8(f8), size=d4.shape[-2:],
                           mode="bilinear", align_corners=False) + self.lat4(d4)
-        x = self.refine(x)
+        x = (checkpoint_module(self.refine, x) if self.activation_checkpointing
+             else self.refine(x))
         logits = self.head(x)
         result = {"logits": F.interpolate(logits, size=out_size, mode="bilinear",
                                            align_corners=False)}

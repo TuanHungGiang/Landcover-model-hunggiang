@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, fields
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
+from .utils.checkpointing import checkpoint_module
 
 from .models import SDRConfig, SDRMambaNet
 
@@ -168,7 +168,8 @@ class HCRSDRNet(SDRMambaNet):
         base_args["architecture_version"] = "r34_layer4_bi_v2"
         super().__init__(SDRConfig(**base_args))
         self.cfg = cfg
-        self.backbone.semantic.enable_gradient_checkpointing(cfg.memory_saver)
+        self.backbone.enable_gradient_checkpointing(cfg.memory_saver)
+        self.decoder.activation_checkpointing = cfg.memory_saver
         k = cfg.num_classes
         self.group_head = nn.Conv2d(cfg.detail8, k, 1)
         self.fine_head = nn.Sequential(
@@ -206,7 +207,8 @@ class HCRSDRNet(SDRMambaNet):
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         maps = self.backbone(x)
-        fused = self.fusion(maps["d8"], maps["s16"])
+        fused = (checkpoint_module(self.fusion, maps["d8"], maps["s16"])
+                 if self.cfg.memory_saver else self.fusion(maps["d8"], maps["s16"]))
         decoder_result = self.decoder(maps["d4"], fused, x.shape[-2:])
         flat_logits = decoder_result["logits"]
         flat_probs = flat_logits.float().softmax(dim=1)
@@ -218,12 +220,8 @@ class HCRSDRNet(SDRMambaNet):
                                 mode="bilinear", align_corners=False)
         p0full = (1 - self.cfg.hierarchy_mix) * flat_probs + self.cfg.hierarchy_mix * ph_full
         graph_inputs = (maps["d8"], maps["s16"], fused, pf8, ph8, pg8, p08)
-        if self.cfg.memory_saver and self.training and torch.is_grad_enabled():
-            # Graph math contains GroupNorm only: safe to recompute on backward.
-            delta, risk_logits = checkpoint(self.graph_refiner, *graph_inputs,
-                                            use_reentrant=False, preserve_rng_state=False)
-        else:
-            delta, risk_logits = self.graph_refiner(*graph_inputs)
+        delta, risk_logits = (checkpoint_module(self.graph_refiner, *graph_inputs)
+                              if self.cfg.memory_saver else self.graph_refiner(*graph_inputs))
         correction = F.interpolate(delta, size=x.shape[-2:],
                                    mode="bilinear", align_corners=False)
         logits = p0full.clamp_min(1e-6).log() + correction

@@ -11,6 +11,7 @@ from torch import nn
 from .detail import DetailEncoder
 from .semantic import SemanticEncoder
 from ..blocks.fusion import BidirectionalStageFusion, SemanticCrossScaleFusion
+from ..utils.checkpointing import checkpoint_module
 
 
 class DualBranchBackbone(nn.Module):
@@ -28,14 +29,23 @@ class DualBranchBackbone(nn.Module):
         )
         self.bi8 = BidirectionalStageFusion(detail8, 128)
         self.cross16 = SemanticCrossScaleFusion(detail8, context_dim)
+        self.activation_checkpointing = False
+
+    def enable_gradient_checkpointing(self, enabled: bool = True):
+        self.activation_checkpointing = bool(enabled)
+        self.detail.enable_gradient_checkpointing(enabled)
+        self.semantic.enable_gradient_checkpointing(enabled)
+
+    def _run(self, module, *inputs):
+        return checkpoint_module(module, *inputs) if self.activation_checkpointing else module(*inputs)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         details = self.detail(x)
         d4, d8 = details["d4"], details["d8"]
         s4 = self.semantic.encode_s4(x)
         s8 = self.semantic.encode_s8(s4)
-        d8, s8 = self.bi8(d8, s8)
+        d8, s8 = self._run(self.bi8, d8, s8)
         s16_raw = self.semantic.encode_s16(s8)
         s32 = self.semantic.encode_s32(s16_raw)
-        s16 = self.cross16(s16_raw, s32, d8)
+        s16 = self._run(self.cross16, s16_raw, s32, d8)
         return {"d4": d4, "d8": d8, "s8": s8, "s16": s16, "s32": s32}

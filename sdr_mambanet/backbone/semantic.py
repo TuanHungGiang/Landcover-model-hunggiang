@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from ..utils.checkpointing import checkpoint_module
 from ..blocks.context import build_context
 
 
@@ -56,27 +56,12 @@ class SemanticEncoder(nn.Module):
         self.activation_checkpointing = False
 
     def enable_gradient_checkpointing(self, enabled: bool = True):
-        """Save VRAM by recomputing ResNet stage activations in backward.
-
-        ImageNet BatchNorm running stats are held fixed when enabled:
-        checkpoint recomputation must NOT update them twice. BN affine
-        weights remain trainable. For from-scratch BN training disable it.
-        """
+        """Recompute ResNet stages during backward, preserving training BN statistics."""
         self.activation_checkpointing = bool(enabled)
-        self.train(self.training)
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if mode and self.activation_checkpointing:
-            for stage in (self.stem, self.layer1, self.layer2, self.layer3, self.layer4):
-                for module in stage.modules():
-                    if isinstance(module, nn.BatchNorm2d):
-                        module.eval()
-        return self
 
     def _run_stage(self, stage, x):
-        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
-            return checkpoint(stage, x, use_reentrant=False, preserve_rng_state=False)
+        if self.activation_checkpointing:
+            return checkpoint_module(stage, x)
         return stage(x)
 
     def encode_s4(self, x: torch.Tensor) -> torch.Tensor:

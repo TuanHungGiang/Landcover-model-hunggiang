@@ -62,7 +62,7 @@ def arguments():
     p.add_argument("--accum", type=int, default=8, help="Accumulation per GPU (effective batch 16 on 2 GPUs)")
     p.add_argument("--workers", type=int, default=2, help="Dataloader workers PER GPU")
     p.add_argument("--memory-saver", action="store_true",
-                   help="Activation checkpoint ResNet + graph; freeze semantic BN running stats")
+                   help="Checkpoint ResNet, RSF detail/decoder, fusion and graph; preserve train BatchNorm stats")
     p.add_argument("--loader-timeout-seconds", type=int, default=120,
                    help="Per-batch timeout when workers>0 (0 disables)")
     p.add_argument("--hang-dump-seconds", type=int, default=180,
@@ -324,8 +324,8 @@ def main():
                 print(f"[EVAL-ONLY] checkpoint={a.eval_only}; training skipped", flush=True)
         if rank == 0:
             if a.memory_saver:
-                print("[MEMORY] activation checkpoint: ResNet stem/layer1..4 + HCR graph; "
-                      "semantic BatchNorm running stats frozen; cudnn benchmark OFF", flush=True)
+                print("[MEMORY] activation checkpoint: ResNet + RSF detail/decoder + fusion + graph; "
+                      "BN training statistics preserved; cudnn benchmark OFF", flush=True)
             print(f"DDP: {world} GPUs | batch/GPU={a.batch} | accumulation={a.accum} "
                   f"| effective_batch={world * a.batch * a.accum} "
                   f"| val_images={len(selected)} | val_total_tiles={len(val_ds)} "

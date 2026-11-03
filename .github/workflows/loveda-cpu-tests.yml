@@ -34,4 +34,5 @@ jobs:
             tests/test_automatic_holdout.py \
             tests/test_ddp_hang_diagnostics.py \
             tests/test_ddp_startup.py \
-            tests/test_hcr_model.py
+            tests/test_hcr_model.py \
+            tests/test_memory_checkpoint.py

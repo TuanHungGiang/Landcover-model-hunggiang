@@ -2,6 +2,7 @@
 from torch import nn
 import torch
 from ..blocks.rsf_rep import RSFRepBlock
+from ..utils.checkpointing import checkpoint_module
 
 
 def _stem(in_channels: int, out_channels: int, stride: int) -> nn.Sequential:
@@ -25,9 +26,16 @@ class DetailEncoder(nn.Module):
         self.stage8 = nn.Sequential(*[
             RSFRepBlock(channels8, kernel_size=rep_kernel) for _ in range(depth8)
         ])
+        self.activation_checkpointing = False
+
+    def enable_gradient_checkpointing(self, enabled: bool = True):
+        self.activation_checkpointing = bool(enabled)
+
+    def _run(self, module, x):
+        return checkpoint_module(module, x) if self.activation_checkpointing else module(x)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = self.stem2(x)
-        d4 = self.stage4(self.stem4(x))
-        d8 = self.stage8(self.down8(d4))
+        x = self._run(self.stem2, x)
+        d4 = self._run(self.stage4, self._run(self.stem4, x))
+        d8 = self._run(self.stage8, self._run(self.down8, d4))
         return {"d4": d4, "d8": d8}
