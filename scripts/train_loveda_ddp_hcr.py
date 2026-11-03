@@ -13,6 +13,7 @@ import os
 import random
 import sys
 import time
+import traceback
 from datetime import timedelta
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -31,6 +32,7 @@ from scripts.loveda_fast import (ROOT, NAMES, FastLoveDA, ImageShardedEvalSample
                                  confusion_metrics, synchronize_eval_buffers)
 from scripts.val200_calibration import select_validation_200
 from scripts.holdout_evaluation import run_final_evaluation
+from scripts.checkpoint_io import snapshot_cpu, atomic_torch_save, stage as ckpt_stage, should_save_last
 from scripts.loveda_regularization import (
     RegularizedLoveDA, top_confusions, lr_multiplier, build_discriminative_groups,
 )
@@ -74,6 +76,10 @@ def arguments():
                    help="Log both ranks before data fetch and after step every N iterations (0 disables)")
     p.add_argument("--ddp-timeout-seconds", type=int, default=600,
                    help="NCCL process-group collective timeout; use 300 for faster debugging")
+    p.add_argument("--checkpoint-timeout-seconds", type=int, default=900,
+                   help="Separate CPU/Gloo control timeout while rank0 saves checkpoint")
+    p.add_argument("--save-last-every", type=int, default=1,
+                   help="Save optimizer/scaler resume checkpoint every N epochs (1 = original behavior)")
     p.add_argument("--lr", type=float, default=2e-4, help="LR for newly initialized modules")
     p.add_argument("--backbone-lr", type=float, default=5e-5,
                    help="Lower LR for ImageNet-pretrained ResNet34")
@@ -247,6 +253,8 @@ def main():
     focus_classes = tuple(int(part) for part in a.focus_classes.split(",") if part.strip())
     if a.batch < 1 or a.accum < 1 or a.workers < 0:
         raise ValueError("--batch/--accum must be positive, --workers nonnegative")
+    if a.save_last_every < 1 or a.checkpoint_timeout_seconds < 60:
+        raise ValueError("save-last-every>=1 and checkpoint-timeout-seconds>=60 required")
     if min(a.loader_timeout_seconds, a.hang_dump_seconds,
            a.heartbeat_every) < 0 or a.ddp_timeout_seconds < 60:
         raise ValueError("Timeouts/heartbeat must be >=0 and DDP timeout >=60 seconds")
@@ -269,6 +277,13 @@ def main():
         dist.destroy_process_group()
         raise RuntimeError("Launch with torchrun --nproc_per_node=2")
     try:
+        # CPU/Gloo control channel is separate from NCCL data collectives:
+        # rank1 can safely wait while rank0 serializes a potentially large
+        # checkpoint, without enqueueing a timed NCCL GPU broadcast.
+        control_group = dist.new_group(
+            backend="gloo", timeout=timedelta(seconds=a.checkpoint_timeout_seconds))
+        print(f"[CHECKPOINT-CONTROL] rank={rank} backend=gloo "
+              f"timeout={a.checkpoint_timeout_seconds}s", flush=True)
         random.seed(a.seed + rank)
         np.random.seed(a.seed + rank)
         torch.manual_seed(a.seed + rank)
@@ -642,38 +657,92 @@ def main():
                       f"mIoU={stats['miou']:.4f} OA={stats['oa']:.4f} "
                       f"train={train_time:.1f}s val={val_time:.1f}s "
                       f"lr_resnet={stats['lr_pretrained']:.2g} lr_new={stats['lr_new']:.2g}", flush=True)
-                stats["early_stop_stale_before_update"] = stale
-                with (output / "history.jsonl").open("a") as fp:
-                    fp.write(json.dumps(stats) + "\n")
-                state = dict(model=ddp.module.state_dict(), epoch=epoch,
-                             best_miou=best, model_config=asdict(ddp.module.cfg),
-                             optimizer=optimizer.state_dict(),
-                             scheduler=scheduler.state_dict(), scaler=scaler.state_dict())
-                previous_best = best
-                if stats["miou"] > best:
-                    best = stats["miou"]
-                    state["best_miou"] = best
-                    torch.save({"model": state["model"], "epoch": epoch,
-                                "best_miou": best, "model_config": state["model_config"]},
-                               output / "best.pt")
-                    (output / "best_metrics.json").write_text(json.dumps(stats, indent=2))
-                stale = 0 if stats["miou"] > previous_best + a.early_stop_min_delta else stale + 1
-                state["best_miou"] = best
-                state["early_stop_stale"] = stale
-                state["training_recipe_version"] = "hcr_v2"
-                state["training_args"] = vars(a)
-                torch.save(state, output / "last.pt")
-                print(f"[EARLY_STOP] stale={stale}/{a.early_stop_patience} best_mIoU={best:.4f}",flush=True)
-            # Rank 0 sends early-stop decision to every GPU. No DDP worker can exit alone.
-            stop = torch.zeros(1, dtype=torch.int32, device=device)
-            if rank == 0 and a.early_stop_patience > 0 and stale >= a.early_stop_patience:
-                stop.fill_(1)
-            dist.broadcast(stop, src=0)
-            if int(stop.item()):
+                save_error = None
+                try:
+                    ckpt_stage(rank, epoch+1, "history_begin")
+                    stats["early_stop_stale_before_update"] = stale
+                    with (output / "history.jsonl").open("a") as fp:
+                        fp.write(json.dumps(stats, allow_nan=False) + "\n")
+                    ckpt_stage(rank, epoch+1, "history_done")
+                    prior_best = best
+                    is_best = stats["miou"] > prior_best
+                    if is_best:
+                        best = stats["miou"]
+                    stale = (0 if stats["miou"] > prior_best + a.early_stop_min_delta
+                             else stale+1)
+                    stopping = bool(a.early_stop_patience>0 and stale>=a.early_stop_patience)
+                    need_last = should_save_last(epoch+1, a.save_last_every,
+                                                 is_final=(epoch+1==a.epochs or stopping))
+                    if is_best or need_last:
+                        ckpt_stage(rank, epoch+1, "gpu_sync_begin")
+                        torch.cuda.synchronize(device)
+                        ckpt_stage(rank, epoch+1, "gpu_sync_done")
+                        ckpt_stage(rank, epoch+1, "model_cpu_snapshot_begin")
+                        model_cpu = snapshot_cpu(ddp.module.state_dict())
+                        ckpt_stage(rank, epoch+1, "model_cpu_snapshot_done")
+                    else:
+                        model_cpu = None
+                    if is_best:
+                        ckpt_stage(rank, epoch+1, "best_pt_write_begin")
+                        bytes_saved = atomic_torch_save(
+                            {"model": model_cpu, "epoch": epoch,
+                             "best_miou": best, "model_config": asdict(ddp.module.cfg)},
+                            output/"best.pt")
+                        ckpt_stage(rank, epoch+1, "best_pt_write_done",
+                                   detail=f"bytes={bytes_saved}")
+                        (output/"best_metrics.json").write_text(json.dumps(stats,indent=2))
+                    if need_last:
+                        ckpt_stage(rank, epoch+1, "optimizer_cpu_snapshot_begin")
+                        optimizer_cpu = snapshot_cpu(optimizer.state_dict())
+                        ckpt_stage(rank, epoch+1, "optimizer_cpu_snapshot_done")
+                        ckpt_stage(rank, epoch+1, "last_pt_write_begin")
+                        bytes_saved = atomic_torch_save(
+                            {"model":model_cpu, "epoch":epoch, "best_miou":best,
+                             "model_config":asdict(ddp.module.cfg),
+                             "optimizer":optimizer_cpu,
+                             "scheduler":scheduler.state_dict(),
+                             "scaler":scaler.state_dict(),
+                             "early_stop_stale":stale,
+                             "training_recipe_version":"hcr_v2",
+                             "training_args":vars(a)},
+                            output/"last.pt")
+                        ckpt_stage(rank, epoch+1, "last_pt_write_done",
+                                   detail=f"bytes={bytes_saved}")
+                    else:
+                        ckpt_stage(rank,epoch+1,"last_pt_skipped",
+                                   detail=f"save_last_every={a.save_last_every}")
+                    print(f"[EARLY_STOP] stale={stale}/{a.early_stop_patience} "
+                          f"best_mIoU={best:.4f} last_saved={need_last}",flush=True)
+                    ckpt_stage(rank, epoch+1, "checkpoint_complete")
+                except Exception as exc:
+                    save_error = f"{type(exc).__name__}: {exc}"
+                    print(f"[CHECKPOINT-ERROR] rank={rank} epoch={epoch+1} "
+                          f"{save_error}",flush=True)
+                    traceback.print_exc()
+            # Rank1 waits on the CPU control group, NEVER an in-flight NCCL
+            # broadcast during rank0 CPU serialization / filesystem writes.
+            ckpt_stage(rank, epoch+1, "control_gloo_enter")
+            # Fields: [should_stop, checkpoint_failed].
+            status = torch.zeros(2, dtype=torch.int32)  # CPU for gloo
+            if rank == 0:
+                status[0] = int(a.early_stop_patience>0 and
+                                stale>=a.early_stop_patience)
+                status[1] = int(save_error is not None)
+            dist.broadcast(status, src=0, group=control_group)
+            ckpt_stage(rank, epoch+1, "control_gloo_exit",
+                       detail=f"stop={int(status[0])} failed={int(status[1])}")
+            if int(status[1]):
+                raise RuntimeError("Rank0 checkpoint saving failed. See [CHECKPOINT-ERROR] and "
+                                   "checkpoint stage logs on rank0.")
+            if int(status[0]):
                 if rank == 0:
-                    print(f"[EARLY_STOP] stopped after epoch {epoch+1}; best_mIoU={best:.4f}", flush=True)
+                    print(f"[EARLY_STOP] stopped after epoch {epoch+1}; "
+                          f"best_mIoU={best:.4f}", flush=True)
                 break
-            dist.barrier()  # Do not let next epoch start while rank0 saves.
+            # No NCCL collectives occur while rank0 is writing checkpoints.
+            ckpt_stage(rank, epoch+1, "next_epoch_barrier_enter")
+            dist.barrier()
+            ckpt_stage(rank, epoch+1, "next_epoch_barrier_exit")
 
         # This path is entered by BOTH ranks, including after early stopping.
         # Keep model/threshold selection on selected 200 images; holdout is scored once.
