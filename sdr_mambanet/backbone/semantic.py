@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from ..blocks.context import build_context
 
 
@@ -52,18 +53,43 @@ class SemanticEncoder(nn.Module):
         )
         self.context = build_context(context_dim, context_type, context_depth)
         self.out_channels = context_dim
+        self.activation_checkpointing = False
+
+    def enable_gradient_checkpointing(self, enabled: bool = True):
+        """Save VRAM by recomputing ResNet stage activations in backward.
+
+        ImageNet BatchNorm running stats are held fixed when enabled:
+        checkpoint recomputation must NOT update them twice. BN affine
+        weights remain trainable. For from-scratch BN training disable it.
+        """
+        self.activation_checkpointing = bool(enabled)
+        self.train(self.training)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode and self.activation_checkpointing:
+            for stage in (self.stem, self.layer1, self.layer2, self.layer3, self.layer4):
+                for module in stage.modules():
+                    if isinstance(module, nn.BatchNorm2d):
+                        module.eval()
+        return self
+
+    def _run_stage(self, stage, x):
+        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(stage, x, use_reentrant=False, preserve_rng_state=False)
+        return stage(x)
 
     def encode_s4(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer1(self.stem(x))
+        return self._run_stage(self.layer1, self._run_stage(self.stem, x))
 
     def encode_s8(self, s4: torch.Tensor) -> torch.Tensor:
-        return self.layer2(s4)
+        return self._run_stage(self.layer2, s4)
 
     def encode_s16(self, s8: torch.Tensor) -> torch.Tensor:
-        return self.layer3(s8)
+        return self._run_stage(self.layer3, s8)
 
     def encode_s32(self, s16: torch.Tensor) -> torch.Tensor:
-        return self.context(self.project32(self.layer4(s16)))
+        return self.context(self.project32(self._run_stage(self.layer4, s16)))
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         s4 = self.encode_s4(x)

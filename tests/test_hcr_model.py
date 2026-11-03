@@ -70,3 +70,24 @@ def test_hierarchy_independent_of_class_names():
     model = HCRSDRNet(HCRConfig(num_classes=6, pretrained_semantic=False))
     assert model.group_head.out_channels == 6
     assert model.class_groups.numel() == 6
+
+
+
+def test_memory_saver_checkpoint_backward_and_bn_stats():
+    # All main-method paths remain trainable; ResNet BN running statistics
+    # stay fixed despite backward recomputation, RSF-reparam branches unaffected.
+    torch.manual_seed(19)
+    model = HCRSDRNet(HCRConfig(pretrained_semantic=False, memory_saver=True,
+                                graph_steps=2)).train()
+    semantic_bn = model.backbone.semantic.layer1[0].bn1
+    before = semantic_bn.running_mean.clone()
+    x = torch.randn(1, 3, 64, 64)
+    target = torch.randint(0, 7, (1, 64, 64))
+    out = model(x)
+    loss = HCRSegmentationLoss()(out, target)["total"]
+    assert torch.isfinite(loss)
+    loss.backward()
+    torch.testing.assert_close(semantic_bn.running_mean, before, rtol=0, atol=0)
+    assert model.backbone.semantic.layer3[0].conv1.weight.grad is not None
+    assert model.graph_refiner.detail_proj.weight.grad is not None
+    assert model.backbone.detail.stage4[0].spatial.branches["region"][1].weight.grad is not None

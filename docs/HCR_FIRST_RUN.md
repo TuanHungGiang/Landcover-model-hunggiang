@@ -105,3 +105,39 @@ first exploratory run, --no-evaluate-holdout is deliberately the default.
   Graph grouping/affinity is not guaranteed to correct erroneous predictions.
 - This is an experimental combination of established ideas, not a validated
   novel/SOTA method. Claims require literature comparison and results.
+
+
+## OOM: memory-saver mode (2 × T4, 16 GB each)
+
+When a prior run used --batch 4, restart the Kaggle kernel (terminate all old
+torchrun GPU processes) and run the same main method with --batch 1 --accum 8
+--memory-saver. The effective batch remains 16 images. Example without a
+previous SDR checkpoint (ResNet34 pretrained ImageNet):
+
+\`\`\`bash
+!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
+  --context conv --size 512 --batch 1 --accum 8 --workers 2 \
+  --memory-saver --epochs 100 --warmup-epochs 5 --group-warmup-epochs 10 \
+  --lr 2e-4 --backbone-lr 5e-5 --augment strong \
+  --focus-prob 0.5 --focus-classes 4,6 \
+  --early-stop-patience 20 --val-count 200 --seed 42 --no-evaluate-holdout \
+  --output /kaggle/working/rsf_hcrnet_loveda_memory_saver
+\`\`\`
+
+The allocator environment setting is optional and may help fragmentation; it
+does **not** fix genuinely insufficient GPU memory. Note: memory-saver
+recomputes encoder stages + graph during backward. It intentionally freezes
+pretrained semantic BatchNorm running statistics to avoid updating them twice
+and can increase training time. Semantic BN affine parameters still learn.
+If training ResNet34 fully from scratch (--no-pretrained), freezing randomly
+initialized BN running statistics is not recommended. Prefer the normal mode
+with --batch 1 or supply pretrained weights.
+
+If still OOM at batch 1, capture the **full CUDA OOM traceback**, especially
+the free/allocated/reserved VRAM numbers and which operation triggers OOM.
+Also run !nvidia-smi to check other processes. The absence of a T4 benchmark
+means VRAM sufficiency is not guaranteed.
+
+For a truly fresh run, do not reuse an old output directory; resume only if
+all training options (including --memory-saver) match the saved checkpoint.

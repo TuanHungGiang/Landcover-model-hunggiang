@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, fields
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .models import SDRConfig, SDRMambaNet
 
@@ -21,6 +22,7 @@ class HCRConfig(SDRConfig):
     graph_lambda: float = 0.5
     graph_eta: float = 0.5
     graph_channels: int = 24
+    memory_saver: bool = False
 
 
 def build_confusion_groups(confusion: torch.Tensor, min_score: float = 0.02):
@@ -166,6 +168,7 @@ class HCRSDRNet(SDRMambaNet):
         base_args["architecture_version"] = "r34_layer4_bi_v2"
         super().__init__(SDRConfig(**base_args))
         self.cfg = cfg
+        self.backbone.semantic.enable_gradient_checkpointing(cfg.memory_saver)
         k = cfg.num_classes
         self.group_head = nn.Conv2d(cfg.detail8, k, 1)
         self.fine_head = nn.Sequential(
@@ -214,8 +217,13 @@ class HCRSDRNet(SDRMambaNet):
         ph_full = F.interpolate(ph8, size=x.shape[-2:],
                                 mode="bilinear", align_corners=False)
         p0full = (1 - self.cfg.hierarchy_mix) * flat_probs + self.cfg.hierarchy_mix * ph_full
-        delta, risk_logits = self.graph_refiner(
-            maps["d8"], maps["s16"], fused, pf8, ph8, pg8, p08)
+        graph_inputs = (maps["d8"], maps["s16"], fused, pf8, ph8, pg8, p08)
+        if self.cfg.memory_saver and self.training and torch.is_grad_enabled():
+            # Graph math contains GroupNorm only: safe to recompute on backward.
+            delta, risk_logits = checkpoint(self.graph_refiner, *graph_inputs,
+                                            use_reentrant=False, preserve_rng_state=False)
+        else:
+            delta, risk_logits = self.graph_refiner(*graph_inputs)
         correction = F.interpolate(delta, size=x.shape[-2:],
                                    mode="bilinear", align_corners=False)
         logits = p0full.clamp_min(1e-6).log() + correction

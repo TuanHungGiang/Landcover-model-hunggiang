@@ -58,9 +58,11 @@ def arguments():
     p.add_argument("--hierarchy-weight", type=float, default=0.2)
     p.add_argument("--flat-weight", type=float, default=0.2)
     p.add_argument("--risk-weight", type=float, default=0.15)
-    p.add_argument("--batch", type=int, default=8, help="Per-GPU batch size")
-    p.add_argument("--accum", type=int, default=2, help="Accumulation per GPU")
+    p.add_argument("--batch", type=int, default=1, help="Per-GPU batch size (default 1 for 16 GB T4)")
+    p.add_argument("--accum", type=int, default=8, help="Accumulation per GPU (effective batch 16 on 2 GPUs)")
     p.add_argument("--workers", type=int, default=2, help="Dataloader workers PER GPU")
+    p.add_argument("--memory-saver", action="store_true",
+                   help="Activation checkpoint ResNet + graph; freeze semantic BN running stats")
     p.add_argument("--loader-timeout-seconds", type=int, default=120,
                    help="Per-batch timeout when workers>0 (0 disables)")
     p.add_argument("--hang-dump-seconds", type=int, default=180,
@@ -207,7 +209,8 @@ def main():
         random.seed(a.seed + rank)
         np.random.seed(a.seed + rank)
         torch.manual_seed(a.seed + rank)
-        torch.backends.cudnn.benchmark = True  # fixed 512/1024 resolution
+        # cudnn.benchmark may select large convolution workspaces on 16 GB T4.
+        torch.backends.cudnn.benchmark = not a.memory_saver
 
         root, output = Path(a.root), Path(a.output)
         if rank == 0:
@@ -252,7 +255,7 @@ def main():
             semantic_weights_path=a.resnet_weights_path if rank == 0 and not a.resume and not weight_source else None,
             context_type=a.context, hierarchy_mix=a.hierarchy_mix,
             graph_steps=a.graph_steps, graph_lambda=a.graph_lambda,
-            graph_eta=a.graph_eta)
+            graph_eta=a.graph_eta, memory_saver=a.memory_saver)
         # Every rank constructs its own model. For --init-from all ranks have
         # already loaded the same checkpoint before NCCL initialization.
         # DDP still broadcasts rank0 weights/buffers on construction.
@@ -303,7 +306,7 @@ def main():
             if ckpt.get("training_recipe_version") != "hcr_v1":
                 raise ValueError("Only resume HCR last.pt; use --init-from for baseline checkpoints")
             prev_args = ckpt.get("training_args", {})
-            for key in ("epochs", "seed", "size", "batch", "accum", "augment", "focus_prob", "focus_classes", "zoom_min", "zoom_max", "warmup_epochs", "min_lr_ratio", "lr", "backbone_lr", "group_warmup_epochs", "confusion_min_score", "hierarchy_mix", "graph_steps", "graph_lambda", "graph_eta", "hierarchy_weight", "flat_weight", "risk_weight"):
+            for key in ("epochs", "seed", "size", "batch", "accum", "memory_saver", "augment", "focus_prob", "focus_classes", "zoom_min", "zoom_max", "warmup_epochs", "min_lr_ratio", "lr", "backbone_lr", "group_warmup_epochs", "confusion_min_score", "hierarchy_mix", "graph_steps", "graph_lambda", "graph_eta", "hierarchy_weight", "flat_weight", "risk_weight"):
                 if key in prev_args and prev_args[key] != getattr(a,key):
                     raise ValueError(f"Resume option changed: {key} ({prev_args[key]} -> {getattr(a,key)})")
             if previous.get("architecture_version") != "r34_layer4_bi_hcr_v1":
@@ -320,6 +323,9 @@ def main():
             if rank == 0:
                 print(f"[EVAL-ONLY] checkpoint={a.eval_only}; training skipped", flush=True)
         if rank == 0:
+            if a.memory_saver:
+                print("[MEMORY] activation checkpoint: ResNet stem/layer1..4 + HCR graph; "
+                      "semantic BatchNorm running stats frozen; cudnn benchmark OFF", flush=True)
             print(f"DDP: {world} GPUs | batch/GPU={a.batch} | accumulation={a.accum} "
                   f"| effective_batch={world * a.batch * a.accum} "
                   f"| val_images={len(selected)} | val_total_tiles={len(val_ds)} "
