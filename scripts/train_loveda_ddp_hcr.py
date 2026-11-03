@@ -27,7 +27,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.loveda_fast import (ROOT, NAMES, FastLoveDA, ImageShardedEvalSampler,
                                  find_pairs, eval_distributed, calibration_samples,
-                                 tune_thresholds_logits)
+                                 tune_thresholds_logits, accumulate_confusion,
+                                 confusion_metrics, synchronize_eval_buffers)
 from scripts.val200_calibration import select_validation_200
 from scripts.holdout_evaluation import run_final_evaluation
 from scripts.loveda_regularization import (
@@ -157,6 +158,64 @@ def load_init_weights(path: str, context: str, rank: int):
     print(f"[rank{rank}][INIT] checkpoint validated "
           f"(source epoch={incoming.get('epoch', 'unknown')})", flush=True)
     return incoming["model"]
+
+
+
+@torch.no_grad()
+def validate_hcr_heads(model, loader, device, *, channels_last=False):
+    """Single-pass DDP validation: Flat, Hierarchy, Mixed, Final and pixel edits."""
+    synchronize_eval_buffers(model)
+    model.eval()
+    cm=torch.zeros((4,7,7),dtype=torch.int64,device=device)
+    changes=torch.zeros(5,dtype=torch.int64,device=device)
+    risk_sum=torch.zeros(4,dtype=torch.float64,device=device)
+    for x,y in loader:
+        x=x.to(device,non_blocking=True)
+        if channels_last: x=x.contiguous(memory_format=torch.channels_last)
+        y=y.to(device,non_blocking=True)
+        with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=device.type=="cuda"):
+            o=model(x)
+        pred_flat=o["flat_logits"].argmax(1)
+        pred_hier=torch.nn.functional.interpolate(
+            o["hier_probs"].float(),size=y.shape[-2:],mode="bilinear",
+            align_corners=False).argmax(1)
+        pred_mix=o["mixed_logits"].argmax(1)
+        pred_final=o["logits"].argmax(1)
+        for i,p in enumerate((pred_flat,pred_hier,pred_mix,pred_final)):
+            accumulate_confusion(cm[i],p,y)
+        valid=y!=255
+        was=pred_mix==y
+        now=pred_final==y
+        changed=valid & (pred_mix!=pred_final)
+        changes[0]+=valid.sum()
+        changes[1]+=changed.sum()
+        changes[2]+=(valid & ~was & now).sum()
+        changes[3]+=(valid & was & ~now).sum()
+        changes[4]+=(changed & ~was & ~now).sum()
+        cover=torch.nn.functional.adaptive_avg_pool2d(
+            valid[:,None].float(),o["risk_logits"].shape[-2:])
+        wrong=torch.nn.functional.adaptive_avg_pool2d(
+            (valid & ~was)[:,None].float(),o["risk_logits"].shape[-2:])
+        risk=o["risk_logits"].float().sigmoid()
+        target=wrong/cover.clamp_min(1e-6)
+        selected=cover>0
+        risk_sum[0]+=risk[selected].double().sum()
+        risk_sum[1]+=target[selected].double().sum()
+        risk_sum[2]+=(risk[selected].double()-target[selected].double()).square().sum()
+        risk_sum[3]+=selected.sum()
+    dist.all_reduce(cm,op=dist.ReduceOp.SUM)
+    dist.all_reduce(changes,op=dist.ReduceOp.SUM)
+    dist.all_reduce(risk_sum,op=dist.ReduceOp.SUM)
+    names=("flat","hierarchy","mixed","final")
+    heads={name:confusion_metrics(cm[i]) for i,name in enumerate(names)}
+    graph=dict(valid_pixels=int(changes[0]),changed_pixels=int(changes[1]),
+               corrected_pixels=int(changes[2]),damaged_pixels=int(changes[3]),
+               wrong_to_wrong=int(changes[4]),
+               net_correct=int(changes[2]-changes[3]),
+               risk_mean=float(risk_sum[0]/risk_sum[3].clamp_min(1)),
+               actual_error=float(risk_sum[1]/risk_sum[3].clamp_min(1)),
+               risk_brier=float(risk_sum[2]/risk_sum[3].clamp_min(1)))
+    return heads["final"],heads,graph
 
 
 def main():
@@ -523,8 +582,8 @@ def main():
                     print(f"[HCR] class groups frozen from Train: {groups}", flush=True)
             # All ranks evaluate disjoint original images; confusion allreduce ONCE.
             start_val = time.perf_counter()
-            stats = eval_distributed(ddp.module, val_dl, device,
-                                     channels_last=a.channels_last)
+            stats, head_metrics, graph_metrics = validate_hcr_heads(
+                ddp.module, val_dl, device, channels_last=a.channels_last)
             val_time = time.perf_counter() - start_val
             if not a.no_diagnostics:
                 diag.write("epoch_rank", epoch=epoch+1,
@@ -561,6 +620,20 @@ def main():
                              train_seconds=round(train_time, 2),
                              val_seconds=round(val_time, 2),
                              train_images_per_second=round((len(train_ds) / max(train_time, 1e-9)), 2))
+                stats["head_metrics"] = head_metrics
+                stats["graph_metrics"] = graph_metrics
+                print(f"[VAL-HCR] epoch={epoch+1} " + " ".join(
+                    f"{name}={head_metrics[name]['miou']:.4f}"
+                    for name in ("flat","hierarchy","mixed","final")) +
+                    f" graph_fixed={graph_metrics['corrected_pixels']}"+
+                    f" graph_broken={graph_metrics['damaged_pixels']}"+
+                    f" graph_net={graph_metrics['net_correct']:+d}"+
+                    f" risk_mean={graph_metrics['risk_mean']:.4f}"+
+                    f" risk_brier={graph_metrics['risk_brier']:.4f}",flush=True)
+                for name in ("flat","hierarchy","mixed","final"):
+                    print(f"[VAL-HCR-CLASS] epoch={epoch+1} stage={name} " +
+                          " | ".join(f"{cls}={head_metrics[name]['iou_per_class'][cls]:.3f}"
+                                     for cls in NAMES),flush=True)
                 stats["hierarchy_strength"] = strength
                 stats["effective_hierarchy_mix"] = a.hierarchy_mix * strength
                 stats["lr_pretrained"] = epoch_lrs[0]

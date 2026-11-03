@@ -56,3 +56,5 @@ Review `diagnostics_selected200/hcr_diagnostic.md` and JSON after training to ju
 **Important:** In this training run use `--no-evaluate-holdout` to preserve the untouched holdout. An earlier experimental run used it once, but repeated tuning on holdout would bias the final assessment.
 
 **Limitations:** CPU smoke/gradient tests do not prove Kaggle VRAM or mIoU gains. No automatic guarantee of improved performance.
+
+Validation diagnostic (one pass, no extra inference): `[VAL-HCR]` compares Flat, Hierarchy, Mixed, Final mIoU and graph fixed/broken pixels and risk Brier; `[VAL-HCR-CLASS]` prints per-class IoU for all four stages each epoch. Group edge similarity now ramps with hierarchy, preventing a sudden graph edge change when groups are selected.

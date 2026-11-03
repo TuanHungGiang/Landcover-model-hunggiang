@@ -108,7 +108,7 @@ class ReliabilityGraphRefiner(nn.Module):
         return y, mask
 
     def forward(self, detail, semantic, fused, flat_probs, hier_probs,
-                group_probs, mixed_probs):
+                group_probs, mixed_probs, group_strength):
         h, w = fused.shape[-2:]
         detail = F.interpolate(detail, (h, w), mode="bilinear", align_corners=False)
         semantic = F.interpolate(semantic, (h, w), mode="bilinear", align_corners=False)
@@ -149,7 +149,8 @@ class ReliabilityGraphRefiner(nn.Module):
             # gate independent of risk, reducing background leakage.
             same_group = (group_probs.float() * group_n).sum(1, keepdim=True)
             same_class = (mixed_probs.float() * mixed_n).sum(1, keepdim=True)
-            agreement = 0.05 + 0.75 * same_class + 0.20 * same_group
+            scheduled_group = (1 - group_strength) * same_class + group_strength * same_group
+            agreement = 0.05 + 0.75 * same_class + 0.20 * scheduled_group
             wij = visual * agreement * mask
             weights.append((dy, dx, wij))
             degree = degree + wij
@@ -242,7 +243,8 @@ class HCRSDRNet(SDRMambaNet):
         ph_full = F.interpolate(ph8, size=x.shape[-2:],
                                 mode="bilinear", align_corners=False)
         p0full = (1 - alpha) * flat_probs + alpha * ph_full
-        graph_inputs = (maps["d8"], maps["s16"], fused, pf8, ph8, pg8, p08)
+        graph_inputs = (maps["d8"], maps["s16"], fused, pf8, ph8, pg8, p08,
+                        self.hierarchy_strength)
         delta, risk_logits = (checkpoint_module(self.graph_refiner, *graph_inputs)
                               if self.cfg.memory_saver else self.graph_refiner(*graph_inputs))
         correction = F.interpolate(delta, size=x.shape[-2:],
