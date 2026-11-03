@@ -22,17 +22,17 @@ loaders/trainers for ISPRS are NOT part of this first LoveDA run).
    fully trained HCR model.
 4. Run in the project directory:
 
-\`\`\`bash
+```bash
 !git clone https://github.com/TuanHungGiang/Landcover-model-hunggiang.git
 %cd /kaggle/working/Landcover-model-hunggiang
 !python -m pytest -q tests/test_hcr_model.py
-\`\`\`
+```
 
 ### First full main-method training (warm-start from V3 best)
 
 Update the checkpoint path below to your own location:
 
-\`\`\`bash
+```bash
 !torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
   --context conv --size 512 --batch 6 --accum 2 --workers 2 \
   --epochs 60 --warmup-epochs 3 \
@@ -43,7 +43,7 @@ Update the checkpoint path below to your own location:
   --early-stop-patience 15 --val-count 200 --seed 42 \
   --no-evaluate-holdout \
   --init-from /kaggle/input/YOUR_BASELINE_CHECKPOINT/best.pt
-\`\`\`
+```
 
 The batch size of 6 per T4 is a **conservative starting value, not measured**
 for HCR. Reduce to 4 or 2 if CUDA OOM. Effective batch size =
@@ -53,14 +53,14 @@ for HCR. Reduce to 4 or 2 if CUDA OOM. Effective batch size =
 
 Remove --init-from and use ImageNet pretrained ResNet34:
 
-\`\`\`bash
+```bash
 !torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
   --context conv --size 512 --batch 6 --accum 2 --workers 2 \
   --epochs 60 --warmup-epochs 3 --group-warmup-epochs 3 \
   --lr 2e-4 --backbone-lr 5e-5 --augment strong \
   --early-stop-patience 15 --val-count 200 --seed 42 \
   --no-evaluate-holdout
-\`\`\`
+```
 
 If Kaggle Internet is OFF and ImageNet weights are not cached, supply
 --resnet-weights-path /kaggle/input/.../resnet34.pth. --no-pretrained trains
@@ -68,7 +68,7 @@ the encoder from scratch and is not an equivalent baseline.
 
 ### Resume without restarting group discovery
 
-\`\`\`bash
+```bash
 !torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
   --context conv --size 512 --batch 6 --accum 2 --workers 2 \
   --epochs 60 --warmup-epochs 3 --group-warmup-epochs 3 \
@@ -77,18 +77,18 @@ the encoder from scratch and is not an equivalent baseline.
   --early-stop-patience 15 --val-count 200 --seed 42 \
   --resume /kaggle/working/rsf_hcrnet_loveda_first_run/last.pt \
   --no-evaluate-holdout
-\`\`\`
+```
 
 For resume, **all options that affect training must match** the initial run,
 including the HCR options. Do not combine --resume with --init-from.
 
 ## Files generated
 
-- \`best.pt\`, \`last.pt\`: full model state including frozen class-group mapping
-- \`train_confusion_groups.json\`: grouping from TRAIN predictions/labels at warm-up
-- \`best_metrics.json\`, \`history.jsonl\`: selected-200 metrics and train record
-- \`val_split_200.json\`: fixed balanced Rural/Urban selection
-- \`calibration.json\`: calibrated on the selected 200 only if enabled
+- `best.pt`, `last.pt`: full model state including frozen class-group mapping
+- `train_confusion_groups.json`: grouping from TRAIN predictions/labels at warm-up
+- `best_metrics.json`, `history.jsonl`: selected-200 metrics and train record
+- `val_split_200.json`: fixed balanced Rural/Urban selection
+- `calibration.json`: calibrated on the selected 200 only if enabled
 
 **Scientific protection:** The remaining 1,469 validation images are not
 consulted during training/group discovery/threshold fitting. Run
@@ -114,7 +114,7 @@ torchrun GPU processes) and run the same main method with --batch 1 --accum 8
 --memory-saver. The effective batch remains 16 images. Example without a
 previous SDR checkpoint (ResNet34 pretrained ImageNet):
 
-\`\`\`bash
+```bash
 !PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
   --context conv --size 512 --batch 1 --accum 8 --workers 2 \
@@ -123,7 +123,7 @@ torchrun --standalone --nproc_per_node=2 scripts/train_loveda_ddp_hcr.py \
   --focus-prob 0.5 --focus-classes 4,6 \
   --early-stop-patience 20 --val-count 200 --seed 42 --no-evaluate-holdout \
   --output /kaggle/working/rsf_hcrnet_loveda_memory_saver
-\`\`\`
+```
 
 The allocator environment setting is optional and may help fragmentation; it
 does **not** fix genuinely insufficient GPU memory. Note: memory-saver
