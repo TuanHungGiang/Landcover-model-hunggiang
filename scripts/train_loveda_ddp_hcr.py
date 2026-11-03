@@ -65,7 +65,9 @@ def arguments():
     p.add_argument("--risk-weight", type=float, default=0.15)
     p.add_argument("--batch", type=int, default=1, help="Per-GPU batch size (default 1 for 16 GB T4)")
     p.add_argument("--accum", type=int, default=8, help="Accumulation per GPU (effective batch 16 on 2 GPUs)")
-    p.add_argument("--workers", type=int, default=2, help="Dataloader workers PER GPU")
+    p.add_argument("--workers", type=int, default=2, help="Training dataloader workers PER GPU")
+    p.add_argument("--val-workers", type=int, default=0,
+                   help="Validation loader workers PER GPU (0 avoids fork after CUDA init)")
     p.add_argument("--memory-saver", action="store_true",
                    help="Checkpoint ResNet, RSF detail/decoder, fusion and graph; preserve train BatchNorm stats")
     p.add_argument("--loader-timeout-seconds", type=int, default=120,
@@ -168,19 +170,55 @@ def load_init_weights(path: str, context: str, rank: int):
 
 
 @torch.no_grad()
-def validate_hcr_heads(model, loader, device, *, channels_last=False):
+def validate_hcr_heads(model, loader, device, *, channels_last=False,
+                       rank=0, epoch=0, progress_every=25):
     """Single-pass DDP validation: Flat, Hierarchy, Mixed, Final and pixel edits."""
-    synchronize_eval_buffers(model)
+    def trace(stage, **fields):
+        meta = " ".join(f"{key}={value}" for key,value in fields.items())
+        print(f"[VAL-TRACE] rank={rank} epoch={epoch} phase={stage} "
+              f"unix={time.time():.3f} {meta}",flush=True)
+
+    trace("gpu_synchronize_begin")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    trace("gpu_synchronize_end")
+    trace("bn_buffer_sync_begin")
+    # Explicit per-buffer progress isolates faults inside NCCL broadcasts.
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        buffers=[b for b in model.buffers() if b.numel() > 0]
+        trace("bn_buffer_sync_count", count=len(buffers))
+        for idx, buffer in enumerate(buffers):
+            if idx == 0 or (idx + 1) % 32 == 0:
+                trace("bn_buffer_broadcast_enter", index=idx+1,
+                      shape=tuple(buffer.shape), dtype=str(buffer.dtype),
+                      device=str(buffer.device))
+            dist.broadcast(buffer, src=0)
+            if idx == 0 or (idx + 1) % 32 == 0:
+                trace("bn_buffer_broadcast_exit", index=idx+1)
+    trace("bn_buffer_sync_end")
     model.eval()
+    trace("loader_iter_begin")
+    iterator=iter(loader)
+    trace("loader_iter_end", count=len(loader))
     cm=torch.zeros((4,7,7),dtype=torch.int64,device=device)
     changes=torch.zeros(5,dtype=torch.int64,device=device)
     risk_sum=torch.zeros(4,dtype=torch.float64,device=device)
-    for x,y in loader:
+    for tile in range(1,len(loader)+1):
+        diagnostic = (tile==1 or tile%progress_every==0 or tile==len(loader))
+        if diagnostic:
+            trace("val_fetch_begin", tile=tile)
+        x,y=next(iterator)
+        if diagnostic:
+            trace("val_fetch_end", tile=tile)
         x=x.to(device,non_blocking=True)
         if channels_last: x=x.contiguous(memory_format=torch.channels_last)
         y=y.to(device,non_blocking=True)
+        if diagnostic:
+            trace("val_forward_begin", tile=tile)
         with torch.autocast(device_type="cuda",dtype=torch.float16,enabled=device.type=="cuda"):
             o=model(x)
+        if diagnostic:
+            trace("val_forward_end", tile=tile)
         pred_flat=o["flat_logits"].argmax(1)
         pred_hier=torch.nn.functional.interpolate(
             o["hier_probs"].float(),size=y.shape[-2:],mode="bilinear",
@@ -209,9 +247,13 @@ def validate_hcr_heads(model, loader, device, *, channels_last=False):
         risk_sum[1]+=target[selected].double().sum()
         risk_sum[2]+=(risk[selected].double()-target[selected].double()).square().sum()
         risk_sum[3]+=selected.sum()
+        if diagnostic:
+            trace("val_metrics_end", tile=tile)
+    trace("val_allreduce_begin")
     dist.all_reduce(cm,op=dist.ReduceOp.SUM)
     dist.all_reduce(changes,op=dist.ReduceOp.SUM)
     dist.all_reduce(risk_sum,op=dist.ReduceOp.SUM)
+    trace("val_allreduce_end")
     names=("flat","hierarchy","mixed","final")
     heads={name:confusion_metrics(cm[i]) for i,name in enumerate(names)}
     graph=dict(valid_pixels=int(changes[0]),changed_pixels=int(changes[1]),
@@ -224,6 +266,8 @@ def validate_hcr_heads(model, loader, device, *, channels_last=False):
     # Return a separate dictionary: the caller attaches the full heads dict
     # to stats["head_metrics"]. Returning heads["final"] by reference would
     # create stats -> head_metrics -> final -> stats and break json.dumps.
+    trace("val_complete", flat=f"{heads['flat']['miou']:.4f}",
+          final=f"{heads['final']['miou']:.4f}")
     return dict(heads["final"]), heads, graph
 
 
@@ -254,6 +298,8 @@ def main():
     if a.backbone_lr <= 0 or a.lr <= 0 or a.early_stop_patience < 0 or a.early_stop_min_delta < 0:
         raise ValueError("Learning rates and early stop arguments must be positive")
     focus_classes = tuple(int(part) for part in a.focus_classes.split(",") if part.strip())
+    if a.val_workers < 0:
+        raise ValueError("--val-workers must be >=0")
     if a.batch < 1 or a.accum < 1 or a.workers < 0:
         raise ValueError("--batch/--accum must be positive, --workers nonnegative")
     if a.save_last_every < 1 or a.checkpoint_timeout_seconds < 60:
@@ -307,6 +353,13 @@ def main():
                 find_pairs(root, "val"), root, output,
                 seed=a.seed, count=a.val_count, resume=True)
 
+        # Capture Python stacks on fatal native signals (SIGSEGV etc.) as
+        # well as the existing periodic hang-stacks. This file stays open
+        # for the whole trainer lifetime, including the next validation.
+        fatal_log = (output / f"fatal_stacks_rank{rank}.log").open("a",encoding="utf-8")
+        faulthandler.enable(file=fatal_log, all_threads=True)
+        print(f"[FATAL-TRACE] rank={rank} log={fatal_log.name}",flush=True)
+
         # Both ranks record their own blocking Python stacks, even if torchrun
         # later terminates the process due to a NCCL watchdog timeout.
         hang_log = None
@@ -327,8 +380,11 @@ def main():
                                timeout_seconds=a.loader_timeout_seconds)
         val_ds = FastLoveDA(selected, a.size, False, cache_size=a.val_cache_images)
         val_sampler = ImageShardedEvalSampler(val_ds, rank, world)
-        val_dl = make_loader(val_ds, 1, a.workers, val_sampler,
+        val_dl = make_loader(val_ds, 1, a.val_workers, val_sampler,
                              timeout_seconds=a.loader_timeout_seconds)
+        print(f"[VAL-SETUP] rank={rank} workers={a.val_workers} "
+              f"tiles={len(val_dl)} method={'main_thread' if a.val_workers == 0 else 'multiprocess'}",
+              flush=True)
 
         cfg = HCRConfig(
             num_classes=7, semantic_encoder="resnet34",
@@ -601,7 +657,8 @@ def main():
             # All ranks evaluate disjoint original images; confusion allreduce ONCE.
             start_val = time.perf_counter()
             stats, head_metrics, graph_metrics = validate_hcr_heads(
-                ddp.module, val_dl, device, channels_last=a.channels_last)
+                ddp.module, val_dl, device, channels_last=a.channels_last,
+                rank=rank, epoch=epoch+1)
             val_time = time.perf_counter() - start_val
             if not a.no_diagnostics:
                 diag.write("epoch_rank", epoch=epoch+1,
@@ -766,6 +823,9 @@ def main():
             hang_log.close()
         if "profiler" in locals() and profiler is not None:
             profiler.close()
+        if "fatal_log" in locals() and fatal_log is not None:
+            faulthandler.disable()
+            fatal_log.close()
         dist.destroy_process_group()
 
 
