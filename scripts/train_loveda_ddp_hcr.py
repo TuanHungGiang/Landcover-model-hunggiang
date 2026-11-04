@@ -70,7 +70,7 @@ def arguments():
                    help="Optional shared Train-only counts cache; validated against current Train mask paths")
     p.add_argument("--batch", type=int, default=1, help="Per-GPU batch size (default 1 for 16 GB T4)")
     p.add_argument("--accum", type=int, default=8, help="Accumulation per GPU (effective batch 16 on 2 GPUs)")
-    p.add_argument("--workers", type=int, default=2, help="Training dataloader workers PER GPU")
+    p.add_argument("--workers", type=int, default=0, help="Train workers per GPU (0 avoids CUDA-fork risks)")
     p.add_argument("--val-workers", type=int, default=0,
                    help="Validation loader workers PER GPU (0 avoids fork after CUDA init)")
     p.add_argument("--memory-saver", action="store_true",
@@ -138,11 +138,12 @@ def arguments():
 
 
 def make_loader(ds, batch, workers, sampler=None, *, shuffle=False, timeout_seconds=120):
-    kwargs = dict(batch_size=batch, num_workers=workers, pin_memory=True,
+    kwargs = dict(batch_size=batch, num_workers=workers, pin_memory=bool(workers),
                   sampler=sampler, shuffle=shuffle and sampler is None)
     if workers > 0:
+        # DataLoader workers must never fork a CUDA-initialized DDP rank.
         kwargs.update(persistent_workers=True, prefetch_factor=2,
-                      timeout=timeout_seconds)
+                      multiprocessing_context="spawn", timeout=timeout_seconds)
     return DataLoader(ds, **kwargs)
 
 
@@ -463,7 +464,8 @@ def main():
         scaler = torch.amp.GradScaler("cuda", enabled=True)
         start, best, stale = 0, -1., 0
         if a.resume:
-            ckpt = torch.load(a.resume, map_location="cpu", weights_only=False)
+            print(f"[RESUME] rank={rank} reading={a.resume}",flush=True)
+            ckpt = torch.load(a.resume, map_location="cpu", weights_only=True)
             previous = ckpt.get("model_config", {})
             if ckpt.get("training_recipe_version") != "hcr_v2":
                 raise ValueError("Only resume HCR last.pt; use --init-from for baseline checkpoints")
@@ -480,6 +482,10 @@ def main():
             scheduler.load_state_dict(ckpt["scheduler"])
             scaler.load_state_dict(ckpt["scaler"])
             start, best, stale = ckpt["epoch"] + 1, ckpt["best_miou"], ckpt.get("early_stop_stale", 0)
+            print(f"[RESUME] rank={rank} next_epoch={start+1} "
+                  f"best_mIoU={best:.4f} stale={stale} "
+                  f"workers={a.workers} val_workers={a.val_workers} "
+                  f"save_last_every={a.save_last_every}",flush=True)
         if a.eval_only:
             start = a.epochs  # Skip training entirely; final evaluation uses supplied checkpoint.
             if rank == 0:

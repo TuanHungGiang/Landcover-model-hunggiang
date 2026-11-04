@@ -40,4 +40,5 @@ jobs:
             tests/test_checkpoint_io.py \
             tests/test_hcr_validation_serialization.py \
             tests/test_hcr_validation_crash.py \
-            tests/test_loveda_weight_search.py
+            tests/test_loveda_weight_search.py \
+            tests/test_hcr_robust_launcher.py
