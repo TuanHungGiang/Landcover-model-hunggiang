@@ -33,6 +33,7 @@ from scripts.loveda_fast import (ROOT, NAMES, FastLoveDA, ImageShardedEvalSample
 from scripts.val200_calibration import select_validation_200
 from scripts.holdout_evaluation import run_final_evaluation
 from scripts.checkpoint_io import snapshot_cpu, atomic_torch_save, stage as ckpt_stage, should_save_last
+from scripts.loveda_class_weights import load_or_count_train, make_class_weights
 from scripts.loveda_regularization import (
     RegularizedLoveDA, top_confusions, lr_multiplier, build_discriminative_groups,
 )
@@ -63,6 +64,10 @@ def arguments():
     p.add_argument("--hierarchy-weight", type=float, default=0.2)
     p.add_argument("--flat-weight", type=float, default=0.2)
     p.add_argument("--risk-weight", type=float, default=0.15)
+    p.add_argument("--class-weight-alpha", type=float, default=0.0,
+                   help="Train-only median-frequency exponent (0 = unweighted baseline)")
+    p.add_argument("--class-counts-json", default=None,
+                   help="Optional shared Train-only counts cache; validated against current Train mask paths")
     p.add_argument("--batch", type=int, default=1, help="Per-GPU batch size (default 1 for 16 GB T4)")
     p.add_argument("--accum", type=int, default=8, help="Accumulation per GPU (effective batch 16 on 2 GPUs)")
     p.add_argument("--workers", type=int, default=2, help="Training dataloader workers PER GPU")
@@ -287,6 +292,8 @@ def main():
         raise ValueError("0 <= warmup-epochs < epochs required")
     if not (1 <= a.group_warmup_epochs <= a.epochs):
         raise ValueError("1 <= group-warmup-epochs <= epochs required")
+    if not (0 <= a.class_weight_alpha <= 1):
+        raise ValueError("--class-weight-alpha must be in [0,1]")
     if not (0 <= a.confusion_min_reciprocal <= 1) or a.hierarchy_ramp_epochs < 1:
         raise ValueError("Invalid reciprocal confusion / hierarchy ramp")
     if not (0 <= a.confusion_min_score <= 1):
@@ -368,8 +375,24 @@ def main():
             faulthandler.dump_traceback_later(a.hang_dump_seconds,
                                              repeat=True, file=hang_log)
         diag = DiagnosticsWriter(output, rank, enabled=not a.no_diagnostics)
+        training_pairs = find_pairs(root, "train")
+        counts_path = (Path(a.class_counts_json) if a.class_counts_json
+                       else output / "train_class_counts.json")
+        if rank == 0:
+            class_count_record = load_or_count_train(training_pairs, root, counts_path)
+            print("[TRAIN-CLASS-COUNTS] " + " | ".join(
+                f"{n}={int(c):,}" for n,c in zip(NAMES,class_count_record["counts"])),flush=True)
+        dist.barrier()
+        if rank != 0:
+            class_count_record = load_or_count_train(training_pairs,root,counts_path,
+                                                      allow_compute=False)
+        class_weights = make_class_weights(class_count_record["counts"],a.class_weight_alpha)
+        if rank == 0:
+            print(f"[CLASS-WEIGHTS] alpha={a.class_weight_alpha:.3f} " +
+                  " | ".join(f"{n}={float(w):.4f}" for n,w in zip(NAMES,class_weights)),
+                  flush=True)
         train_ds = RegularizedLoveDA(
-            find_pairs(root, "train"), a.size, True,
+            training_pairs, a.size, True,
             cache_size=a.train_cache_images, augment=a.augment,
             focus_probability=a.focus_prob, focus_classes=focus_classes,
             zoom_min=a.zoom_min, zoom_max=a.zoom_max,
@@ -423,7 +446,8 @@ def main():
         profiler = StepCudaTimer(ddp.module) if rank == 0 and not a.no_diagnostics and a.profile_every else None
         loss_fn = HCRSegmentationLoss(
             ignore_index=255, hierarchy_weight=a.hierarchy_weight,
-            flat_weight=a.flat_weight, risk_weight=a.risk_weight).to(device)
+            flat_weight=a.flat_weight, risk_weight=a.risk_weight,
+            class_weights=(class_weights if a.class_weight_alpha>0 else None)).to(device)
         if a.fused_adamw:
             try:
                 optimizer = torch.optim.AdamW(build_discriminative_groups(ddp.module, a.lr, a.backbone_lr),
@@ -444,7 +468,7 @@ def main():
             if ckpt.get("training_recipe_version") != "hcr_v2":
                 raise ValueError("Only resume HCR last.pt; use --init-from for baseline checkpoints")
             prev_args = ckpt.get("training_args", {})
-            for key in ("epochs", "seed", "size", "batch", "accum", "memory_saver", "confusion_min_reciprocal", "hierarchy_ramp_epochs", "augment", "focus_prob", "focus_classes", "zoom_min", "zoom_max", "warmup_epochs", "min_lr_ratio", "lr", "backbone_lr", "group_warmup_epochs", "confusion_min_score", "hierarchy_mix", "graph_steps", "graph_lambda", "graph_eta", "hierarchy_weight", "flat_weight", "risk_weight"):
+            for key in ("class_weight_alpha", "epochs", "seed", "size", "batch", "accum", "memory_saver", "confusion_min_reciprocal", "hierarchy_ramp_epochs", "augment", "focus_prob", "focus_classes", "zoom_min", "zoom_max", "warmup_epochs", "min_lr_ratio", "lr", "backbone_lr", "group_warmup_epochs", "confusion_min_score", "hierarchy_mix", "graph_steps", "graph_lambda", "graph_eta", "hierarchy_weight", "flat_weight", "risk_weight"):
                 if key in prev_args and prev_args[key] != getattr(a,key):
                     raise ValueError(f"Resume option changed: {key} ({prev_args[key]} -> {getattr(a,key)})")
             if previous.get("architecture_version") != "r34_layer4_bi_hcr_v2":

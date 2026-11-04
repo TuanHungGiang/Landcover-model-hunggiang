@@ -44,11 +44,14 @@ def get_multiclass_boundary(target: torch.Tensor, ignore_index: int = 255) -> to
 
 class SegmentationLoss(nn.Module):
     def __init__(self, ignore_index: int = 255, dice_weight: float = 1.0,
-                 boundary_weight: float = 0.0):
+                 boundary_weight: float = 0.0,
+                 class_weights: torch.Tensor | None = None):
         super().__init__()
         self.ignore_index = ignore_index
         self.dice_weight = dice_weight
         self.boundary_weight = boundary_weight
+        self.register_buffer("class_weights",
+                             None if class_weights is None else torch.as_tensor(class_weights,dtype=torch.float32).clone())
 
     def forward(self, out: dict[str, torch.Tensor], target: torch.Tensor) -> dict[str, torch.Tensor]:
         logits = out["logits"]
@@ -56,7 +59,8 @@ class SegmentationLoss(nn.Module):
             raise ValueError(f"target BHW mismatch: {target.shape} vs {logits.shape}")
         valid = (target != self.ignore_index)
         if valid.any():
-            ce = F.cross_entropy(logits.float(), target.long(), ignore_index=self.ignore_index)
+            ce = F.cross_entropy(logits.float(), target.long(), weight=self.class_weights,
+                                 ignore_index=self.ignore_index)
         else:
             ce = logits.sum() * 0.0
         dice = soft_dice_loss(logits, target, ignore_index=self.ignore_index)

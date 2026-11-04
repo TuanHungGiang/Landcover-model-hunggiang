@@ -8,13 +8,15 @@ from .segmentation import SegmentationLoss
 
 class HCRSegmentationLoss(nn.Module):
     def __init__(self, ignore_index: int = 255, hierarchy_weight: float = 0.2,
-                 flat_weight: float = 0.2, risk_weight: float = 0.15):
+                 flat_weight: float = 0.2, risk_weight: float = 0.15,
+                 class_weights: torch.Tensor | None = None):
         super().__init__()
         self.ignore_index = ignore_index
         self.hierarchy_weight = hierarchy_weight
         self.flat_weight = flat_weight
         self.risk_weight = risk_weight
-        self.base = SegmentationLoss(ignore_index=ignore_index, dice_weight=1.0)
+        self.base = SegmentationLoss(ignore_index=ignore_index, dice_weight=1.0,
+                                     class_weights=class_weights)
 
     def forward(self, out: dict[str, torch.Tensor], target: torch.Tensor):
         parts = self.base(out, target)
@@ -24,14 +26,16 @@ class HCRSegmentationLoss(nn.Module):
             return {**parts, "hierarchy": zero, "flat": zero,
                     "risk": zero, "total": parts["total"] + zero}
         flat = out["flat_logits"]
-        flat_ce = F.cross_entropy(flat.float(), target.long(), ignore_index=self.ignore_index)
+        flat_ce = F.cross_entropy(flat.float(), target.long(),
+                                  weight=self.base.class_weights,ignore_index=self.ignore_index)
         h, w = out["hier_probs"].shape[-2:]
         # Group/fine prediction supervised at the graph resolution.
         target_small = F.interpolate(target.unsqueeze(1).float(), size=(h, w),
                                      mode="nearest").squeeze(1).long()
         if bool((target_small != self.ignore_index).any()):
             hier_loss = F.nll_loss(out["hier_probs"].float().clamp_min(1e-6).log(),
-                                   target_small, ignore_index=self.ignore_index)
+                                   target_small,weight=self.base.class_weights,
+                                   ignore_index=self.ignore_index)
         else:
             hier_loss = out["hier_probs"].sum() * 0.
         with torch.no_grad():
